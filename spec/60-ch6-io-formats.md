@@ -35,6 +35,8 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 
 该映射覆盖 Android uiautomator dump、accessibility 服务导出与主流 GUI 数据集（AndroidControl/AMEX 风格）的常见字段名；不匹配的导出格式可在采集侧做一次字段重命名。
 
+**图片模式（v1.22）。**`segment.mode = "image"` 时不读取 `uitree_<index>.jsonl`：一张 `image_<index>.(png/jpg/jpeg)` 就是一个样本，可选伴随文件名为 `image_<index>` 加 `segment.companion_suffix`，原始字节只交给 `segment.box_parser`。发现规则见 3.2.10，参考框格式见 3.18.4。
+
 ## 6.3 主输出 JSONL
 
 每行一个 JSON object。`meta_mode` 三种形态：
@@ -61,7 +63,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                "generated_from": [], "fields": {},           // passthrough_fields 落点
                "generator": null},   // v1.2 只增：flat 生成记录为 {"llm", "style"}（3.6.2），否则 null
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
-    // = null 当 segment 未启用；process stream 启用时（3.14/3.10.3）：
+    // = null 当 segment.sequence_resolved 为假（segment 未启用或图片模式）；process stream 启用时（3.14/3.10.3）：
     // {"episode_id", "session_id", "order_span": [first, last], "member_count",
     //  "member_ids": [...], "member_positions": [...],
     //  "member_sources": [{file, pair_index|line_no}, ...],
@@ -94,6 +96,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
     //                            // 包络规范句：多碎片线索的顶层 order_span 为包络（区间内含
     //                            //   异线索帧）——精确归属必须用 fragments[].member_positions，
     //                            //   不得按顶层跨度切片（3.16.4）
+    // v1.22 条件键 "regions"（仅图片模式出现，位置：stream 之后、scores 之前），结构见本节 _meta.regions 段
     "scores": {"screenshot_readability": 0.81, "tree_screen_consistency": 0.66,
                "state_completeness": 0.74, "interaction_richness": 0.52,
                "__aggregate__": 0.68, "mode": "pairwise_bt", "batch_no": 3},
@@ -109,6 +112,26 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   }
 }
 ```
+
+**v1.22 图片模式 `_meta.regions`。**`_meta` 顶层键序为 id、run、source、stream、regions、scores、dedup、classification、annotation、verification；图片模式下 `stream` 恒为 `null`，`regions` 恒为对象，annotate 关闭的只分割运行同样输出该块。这是通用信封第一个顶层条件键，也是「全部键恒在」约定的唯一例外：非图片模式下该键不出现，所以非图片工程输出逐字节不变。
+
+```json
+"regions": {
+  "image": {"width": 1080, "height": 2340},
+  "boxes": [{"id": "n12", "bbox": [43, 140, 821, 1264], "text": "Button 登录"}],
+  "items": [
+    {"region_id": "n12",
+     "geometry": {"type": "Polygon",
+                  "coordinates": [[[43, 140], [821, 140], [821, 1264], [43, 1264], [43, 140]]]},
+     "box_id": "n12",
+     "source_box_ids": ["n12"]}
+  ]
+}
+```
+
+`geometry` 单部件为 `{"type": "Polygon", "coordinates": [外环, *内环]}`，多部件为 `{"type": "MultiPolygon", "coordinates": [[外环, *内环], ...]}`；环序与顶点顺序不变，数值类型保留，原图像素不取整（x、y 精度见 3.18.3）。`boxes` 未注册钩子或无伴随文件时为空数组。`items[]` 与后处理上下文 `regions[]` 逐元素同形。图片路径见 `_meta.source.file`，不重复存放。
+
+**v1.22 图片模式记录载荷。**annotate 关闭时的主输出与 rejects `full` 档的 `record` 载荷冻结为 `{"image_path": str}`，有伴随文件时追加 `"companion_path": str`；不含 `ui_tree` 键，不内联伴随字节。非图片 UI 模态仍为 `{ui_tree, image_path}`，字节不变。
 
 **v1.21 sequence 主输出。**sequence 形态的 main 每行是一条 primary sequence，
 `Record.id = sequence_id`，并在 `_meta.generation` 携带冻结的 sequence truth。declared 形态包含
@@ -133,13 +156,19 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
               "failed": 9, "generated": 0, "emitted": 4220},
   // counts v1.6 只增：熔断中止时增列 "unprocessed"（已入流水线但因中止未走完的记录数，见本节尾注不变量扩展）
   // counts v1.7 只增：classify.assignment="multi" 时增列 "fanout"（扇出净增信封数，M10 计量，3.10.3；见尾注不变量扩展）
-  // counts v1.8 只增：segment 启用时增列 "episodes"（segment 阶段 len 差，M10 计量，fanout 同构）/
+  // counts v1.8 只增：segment.sequence_resolved 时增列 "episodes"（segment 阶段 len 差，M10 计量，fanout 同构）/
   //             "absorbed" / "dropped_noise"（post-emit tally，3.10.3）；且 stream 模式下 "unprocessed"
   //             的出现条件扩为「熔断 ∨ interrupted」（S18；见尾注不变量扩展）
   // counts v1.9 只增：stitch 启用时增列 "stitched"（壳终态 tally——仅计被并 episode 信封壳）/
   //             "threads"（= episodes − stitched，M10 post-emit tally 导出式单点上报，3.10.3）；
   //             两键仅启用时在场（off 时 counts 与 v1.8 逐字节等价，3.16.4 退化锚）
-  // v1.8 可选节（segment 启用时出现，位于 counts 之后）：
+  // counts v1.22 只增：图片模式增列 "ignored_files"（IngestReport.ignored_files，位于 fanout 之后、unprocessed 之前；
+  //             不参与守恒式，非图片模式该键不出现，3.2.10）
+  // v1.22 可选节（仅图片模式出现，位于 counts 及 estimate 之后、dedup 之前，键序冻结；计数语义见本节尾注）：
+  //   "segment_image": {"calls": 0, "samples": 0, "boxes": 0, "regions": 0, "empty": 0,
+  //                     "failed": {},
+  //                     "usage": {"prompt_tokens": 0, "completion_tokens": 0}},
+  // v1.8 可选节（segment.sequence_resolved 时出现，位于 counts 之后）：
   //   "stream": {"sessions", "episodes", "mean_episode_len", "absorbed", "dropped_noise",
   //              "below_min_len", "digest_poor_frames", "segment_failures",
   //    [预算启用，v1.11] "windows",   // segment 实际窗数（M14 属主，V13④）——供对账 dry-run/估算的
@@ -221,7 +250,7 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
 validate 与 estimate 同样不启动 runtime，也不新增数据工件。该块不得包含 endpoint、origin、prompt、payload、
 state、callable repr 或 API key。
 
-不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8/v1.9：segment 启用时守恒式为全展开形（3.10.3；`stitched` 为 v1.9 增项，仅 stitch 启用时非零在场）——
+不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8/v1.9：`segment.sequence_resolved` 时守恒式为全展开形（3.10.3；`stitched` 为 v1.9 增项，仅 stitch 启用时非零在场）——
 
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed + stitched = scanned + generated + fanout + episodes`
 
@@ -232,6 +261,8 @@ v1.21 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功
 **rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。
 
 **v1.21 sequence rejects 边界：**sequence 形态的六路径集合令 `rejects = sidecar = null`。失败 attempt 从未成为正式 Record，不写 rejects；它只进入 `report.generate.sequence.rejected_attempts` 的唯一终态桶。任一 slot 耗尽写独立 failed report 并以退出码 1 结束，不提交已接受前缀。普通 process、flat generate 与 process stream 的 rejects 规则保持本段既有语义。
+
+`report.segment_image` 计数语义（v1.22）：`calls` 为提交的模型任务数（不含 L3），D15 路径恒 0；`samples` 为进入 segment 阶段的 active 记录数；`boxes` 为成功记录的 `RegionSet.boxes` 长度之和；`regions` 为 `RegionSet.regions` 长度之和；`empty` 为 `regions` 为空元组的记录数；`failed` 为 `{错误码: 条数}`，只列出现过的码，键按字典序，无失败时 `{}`；`usage` 为分割调用用量，来自 `ValidatedPostCall.usage` 与修复穷尽时的 `SchemaViolation.usage`，首轮超限或 provider 错误没有响应，不计，D15 路径全为 0。键名与 `report.llm_usage` 同名，用来拆分 segment 与 annotate 共用同一 profile 时的成本。现有 `counts.*` 键与守恒恒等式不变。
 
 ### 6.4.1 v1.21 sequence success report
 

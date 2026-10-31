@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, NoReturn, Sequence
 
 from labelkit import TOOL_VERSION, __version__
+from labelkit.common.config._segment_image import image_mode
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, DeliveryError, InternalError
@@ -124,7 +125,7 @@ _SEQUENCE_CALL_KEYS = (
     "noise_evaluation_calls",
 )
 
-# 时序流五键的零值底盘（非流分支恒取此值）。
+# 时序流五键的零值底盘（非流分支恒取此值；v1.22 图片模式只改写其中的 segment_calls）。
 _STREAM_CALLS_ZERO = {"segment_calls": 0, "stitch_calls": 0, "extract_calls": 0,
                       "frame_classify_calls": 0, "frame_annotate_calls": 0}
 
@@ -156,7 +157,8 @@ class _EstimateScale:
     batches: int                                   # 批次数
     pools: list[int]                               # 每批 pairwise 评审池大小
     downstream_base: int                           # quality/annotate/verify 的记录基数
-    stream_calls: dict                             # 时序流五键调用数（非流分支全 0）
+    stream_calls: dict                             # 时序流五键调用数（非流分支全 0；
+                                                   # 图片模式只有 segment_calls 可非 0）
 
 
 @dataclass(frozen=True)
@@ -271,11 +273,14 @@ def _estimate_scale(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> _Estima
         pools.append(total_records % bs)
     n_batches, downstream_base = len(pools), total_records
     stream_calls = dict(_STREAM_CALLS_ZERO)
-    if cfg.segment.enabled and cfg.run.mode == "process":
+    if cfg.segment.sequence_resolved and cfg.run.mode == "process":
         session_lens = tuple(getattr(plan, "session_lens", ()) or ())
         pools = [1] * len(session_lens)
         n_batches = downstream_base = len(session_lens)
         stream_calls = _estimate_stream_calls(cfg, session_lens)
+    elif image_mode(cfg.segment) and cfg.segment.llm_referenced:
+        # v1.22：每个样本一个分割任务（不含修复轮）；只用参考框时不调用模型，保持 0（§7.9）。
+        stream_calls["segment_calls"] = n_ingested
     return _EstimateScale(total_records=total_records, ingested=n_ingested,
                           generated=gen_records, generate_calls=gen_calls,
                           batches=n_batches, pools=pools,
@@ -299,7 +304,7 @@ def _estimate_classify_calls(cfg: "ResolvedConfig", scale: _EstimateScale) -> in
         return 0
     if cfg.run.mode == "generate_only":
         base = scale.generated
-    elif cfg.segment.enabled:
+    elif cfg.segment.sequence_resolved:
         base = scale.downstream_base
     else:
         base = scale.ingested
@@ -706,7 +711,7 @@ class ProcessWorkflow:
         assert self.ingestor is not None, "process mode requires an Ingestor"
         if getattr(self.ingestor, "metrics", None) is None:
             self.ingestor.metrics = self.metrics   # trace 接线（CONTRACTS §7.1）
-        if self.cfg.segment.enabled:
+        if self.cfg.segment.sequence_resolved:
             # 普通流以完整会话为暂存与提交边界；计算组大小由 RunContext 限制。
             await self._run_process_stream()
             return
@@ -974,7 +979,7 @@ class ProcessWorkflow:
                          "duration_ms": int((time.perf_counter() - t_batch) * 1000)}
         if cfg.classify.enabled:
             payload["fanout"] = batch_fanout
-        if cfg.segment.enabled:
+        if cfg.segment.sequence_resolved:
             payload["episodes"] = batch_episodes
             payload["absorbed"] = tally.get("absorbed", 0)
             payload["dropped_noise"] = tally.get("dropped_noise", 0)
@@ -1052,7 +1057,7 @@ class ProcessWorkflow:
                   extra={"stage": "run", "batch": 0})
         cfg = self.cfg
         seg_prof = (cfg.llm_profiles.get(cfg.segment.llm)
-                    if cfg.segment.enabled else None)
+                    if cfg.segment.sequence_resolved else None)
         if seg_prof is not None and seg_prof.context_window > 0:
             _log.info("segment: minimum_frames=%d window=%d (budget)",
                       budget.min_window(cfg), cfg.segment.window,
@@ -1171,8 +1176,10 @@ class ProcessWorkflow:
         if cfg.dry_run:
             # dry-run 报告直接引用本次唯一 estimate_run 结果，避免 console/JSON 漂移。
             report["estimate"] = self._estimate_cache or self._estimate()
-        if cfg.segment.enabled:
+        if cfg.segment.sequence_resolved:
             report["stream"] = self._report_stream(c, counts, ingest_report)
+        if image_mode(cfg.segment):
+            report["segment_image"] = self._report_segment_image(c)
         if cfg.dedup.enabled:
             report["dedup"] = self._report_dedup(c)
         if cfg.quality.enabled:
@@ -1207,6 +1214,7 @@ class ProcessWorkflow:
         才出现（episodes 来自 len 差值计量，absorbed/dropped_noise 来自 post-emit 清点）。
         v1.9 只增（T7）：stitched 来自 post-emit 清点，threads 是**单点导出**
         threads = episodes − stitched（不设第二计数器——T16 双落点护栏）。
+        v1.22 只增：ignored_files 只在图片模式出现，来自 M2 账本，不参与守恒式。
 
         @param c: 计数器视图
         @param ingest_report: M2 摄取报表（generate_only 下为 None）
@@ -1226,16 +1234,40 @@ class ProcessWorkflow:
         }
         if cfg.classify.enabled and cfg.classify.assignment == "multi":
             counts["fanout"] = c("counts.fanout")
-        if cfg.segment.enabled:
+        if image_mode(cfg.segment):
+            counts["ignored_files"] = int(getattr(ingest_report, "ignored_files", 0))
+        if cfg.segment.sequence_resolved:
             counts["episodes"] = c("counts.episodes")
             counts["absorbed"] = c("counts.absorbed")
             counts["dropped_noise"] = c("counts.dropped_noise")
         if cfg.stitch.enabled:
             counts["stitched"] = c("counts.stitched")
             counts["threads"] = counts["episodes"] - counts["stitched"]
-        if self._circuit_broken or (cfg.segment.enabled and self._interrupted):
+        if self._circuit_broken or (cfg.segment.sequence_resolved and self._interrupted):
             counts["unprocessed"] = self._unprocessed_residual(counts)
         return counts
+
+    @staticmethod
+    def _report_segment_image(c: _CounterView) -> dict:
+        """组装 report.segment_image（CONTRACTS §9.3，键序冻结）。
+
+        ``failed`` 只列出现过的错误码，键按字典序；D15 路径没有计数器写入，calls 与 usage 恒为 0。
+
+        @param c: 计数器视图
+        @return: segment_image 块
+        """
+        prefix = "segment_image.failed."
+        failed = {key[len(prefix):]: c(key) for key in sorted(c.values) if key.startswith(prefix)}
+        return {
+            "calls": c("segment_image.calls"),
+            "samples": c("segment_image.samples"),
+            "boxes": c("segment_image.boxes"),
+            "regions": c("segment_image.regions"),
+            "empty": c("segment_image.empty"),
+            "failed": failed,
+            "usage": {"prompt_tokens": c("segment_image.prompt_tokens"),
+                      "completion_tokens": c("segment_image.completion_tokens")},
+        }
 
     def _unprocessed_residual(self, counts: dict) -> int:
         """counts.unprocessed = 平衡残差，使守恒式扩展为 emitted + dropped_* + failed +
@@ -1582,7 +1614,7 @@ class ProcessWorkflow:
             "profiles": {name: {"context_window": cw, "input_budget": ib}
                          for name, cw, ib in budget_profiles},
         }
-        if self.cfg.segment.enabled:
+        if self.cfg.segment.sequence_resolved:
             # 必要的完整相邻帧单位；不声称任意输入都能装入窗口。
             block["minimum_frames"] = 2
         trunc_prefix = "budget.truncations."
@@ -1748,11 +1780,11 @@ class ProcessWorkflow:
                                      or self._class_overrides_exist()):
             print("dry-run: note: estimated with global config / multi reports a "
                   "lower bound at label multiplier 1", file=sys.stderr)
-        if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+        if cfg.segment.sequence_resolved and cfg.segment.strategy in ("llm", "hybrid"):
             note = ("dry-run: note: stream estimate: downstream reports a lower bound "
                     "at episodes≈sessions (LLM refinement only adds segments)")
             print(note, file=sys.stderr)
-        if cfg.segment.enabled:
+        if cfg.segment.sequence_resolved:
             print("dry-run: note: capacity repartition and retries may change actual sequence and call counts",
                   file=sys.stderr)
 

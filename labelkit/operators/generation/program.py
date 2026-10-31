@@ -197,6 +197,9 @@ def generation_program_digest(program: GenerationProgram) -> str:
 def _semantic_value(value):
     """把 dataclass 图转换为排除 callable 的 JSON-compatible 值。
 
+    ``region_ref_paths`` 只属于图片模式，生成工程由 rule 81a 保证恒为空；它不进入摘要，
+    生成工程的 program digest 与由它派生的标识因此不随 v1.22 变化。
+
     @param value 任意冻结配置值。
     @return 规范摘要输入。
     """
@@ -206,7 +209,7 @@ def _semantic_value(value):
         return {
             field.name: _semantic_value(getattr(value, field.name))
             for field in dataclasses.fields(value)
-            if field.name != "digest"
+            if field.name not in ("digest", "region_ref_paths")
         }
     if isinstance(value, Mapping):
         return {str(key): _semantic_value(item) for key, item in value.items()}

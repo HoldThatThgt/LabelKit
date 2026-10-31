@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["region_id", "label", "geometry"],
+        "properties": {
+          "region_id": {"type": "string", "x-labelkit-region-ref": true},
+          "label": {"type": "string"},
+          "geometry": {
+            "x-labelkit-postprocessor": true,
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "coordinates"],
+            "properties": {
+              "type": {"type": "string", "enum": ["Polygon", "MultiPolygon"]},
+              "coordinates": {"type": "array", "minItems": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}

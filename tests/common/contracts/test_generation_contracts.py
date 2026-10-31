@@ -21,6 +21,7 @@ from labelkit.common.config.model import (
     ResolvedPaths,
 )
 from labelkit.common.contracts import generation as contracts_generation
+from labelkit.common.contracts import post_validation as contracts_post_validation
 from labelkit.common.contracts.execution import TaskExecutor
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import PipelineItem, Record, Usage
@@ -230,11 +231,6 @@ CONTRACT_FIELDS = {
     ),
     "StateTransitionInput": (
         "slot_key", "variant", "role", "state_before", "state_after", "patch",
-    ),
-    "PostValidationResult": ("violations", "event_execution"),
-    "PostValidatedCallRequest": ("profile", "prompt", "schema", "scope", "post_validator"),
-    "ValidatedGenerationCall": (
-        "object", "event_execution", "resolved_at", "usage", "attempts", "model",
     ),
     "RenderEventRequest": (
         "semantic_profile", "slot_key", "planned_event", "event_plan", "actor_view",
@@ -497,16 +493,6 @@ CONTRACT_TYPES = {
         str, str | None, str | None, _JSON_OBJECT, _JSON_OBJECT,
         tuple[_JSON_OBJECT, ...],
     ),
-    "PostValidationResult": (
-        tuple[str, ...], contracts_generation.EventExecution | None),
-    "PostValidatedCallRequest": (
-        str, PromptBundle, _JSON_OBJECT, CallScope,
-        Callable[[Mapping[str, object]], contracts_generation.PostValidationResult],
-    ),
-    "ValidatedGenerationCall": (
-        _JSON_OBJECT, contracts_generation.EventExecution,
-        Literal["l0_or_clean", "l1", "l3_1", "l3_2"], Usage, int, str,
-    ),
     "RenderEventRequest": (
         str, str, contracts_generation.PlannedEvent, contracts_generation.EventPlan,
         contracts_generation.ActorView, _JSON_OBJECT, str, str, _JSON_OBJECT,
@@ -678,7 +664,7 @@ INTERFACE_MANIFEST = (
     (state.post_validate_event_plan, False, ("candidate", "context"), {
         "candidate": typing.Mapping[str, object],
         "context": contracts_generation.EventExecutionContext,
-        "return": contracts_generation.PostValidationResult,
+        "return": contracts_post_validation.PostValidationResult,
     }),
     (render.render_event, True, ("request", "services"), {
         "request": contracts_generation.RenderEventRequest,
@@ -870,8 +856,8 @@ METHOD_MANIFEST = (
          "report": typing.Mapping[str, object], "return": type(None),
      }),
     (SchemaEngine.complete_post_validated, True, ("self", "request"), {
-        "request": contracts_generation.PostValidatedCallRequest,
-        "return": contracts_generation.ValidatedGenerationCall,
+        "request": contracts_post_validation.PostValidatedCallRequest,
+        "return": contracts_post_validation.ValidatedPostCall,
     }),
 )
 
@@ -980,7 +966,7 @@ def test_generation_limit_defaults_are_exact():
 def test_call_scope_manifest_is_exact():
     assert tuple(field.name for field in dataclasses.fields(CallScope)) == (
         "record_ids", "batch_no", "record", "user_treatment", "repair_context_bytes", "complete_evidence",
-        "retain_repair_prompt",
+        "retain_repair_prompt", "region_ids", "region_ref_paths",
     )
     assert get_type_hints(CallScope) == {
         "record_ids": tuple[str, ...],
@@ -990,8 +976,10 @@ def test_call_scope_manifest_is_exact():
         "repair_context_bytes": int | None,
         "complete_evidence": bool,
         "retain_repair_prompt": bool,
+        "region_ids": frozenset[str] | None,
+        "region_ref_paths": tuple[str, ...],
     }
-    assert CallScope() == CallScope((), 0, None, None, None, False, False)
+    assert CallScope() == CallScope((), 0, None, None, None, False, False, None, ())
 
 
 @pytest.mark.parametrize(
@@ -1030,8 +1018,10 @@ def test_changed_annotations_are_exact():
     assert parse_context["hook_loader"] == Callable[[str, Path], contracts_generation.ResolvedHook]
     assert get_type_hints(contracts_generation.ReplayProjectionRequest)["source"] \
         is contracts_generation.SequenceRows
-    assert get_type_hints(contracts_generation.PostValidatedCallRequest)["schema"] \
-        == Mapping[str, object]
+    assert get_type_hints(
+        contracts_post_validation.PostValidatedCallRequest,
+        localns={"PromptBundle": PromptBundle, "CallScope": CallScope, "Usage": Usage},
+    )["schema"] == Mapping[str, object]
 
 
 @pytest.mark.parametrize(("name", "expected"), _CARRIER_DOC_FIELDS.items())
@@ -1153,8 +1143,8 @@ def test_common_generation_interface_signatures_are_exact():
     assert tuple(signature.parameters) == ("self", "request")
     assert signature.parameters["request"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     hints = get_type_hints(method)
-    assert hints["request"] is contracts_generation.PostValidatedCallRequest
-    assert hints["return"] is contracts_generation.ValidatedGenerationCall
+    assert hints["request"] is contracts_post_validation.PostValidatedCallRequest
+    assert hints["return"] is contracts_post_validation.ValidatedPostCall
 
 
 def test_mapping_carriers_recursively_copy_and_freeze_json():

@@ -9,12 +9,13 @@ dependencies = [
     "jsonpatch>=1.33",
     "jsonpointer>=3.0",
     "datasketch>=1.6",
-    "Pillow>=10.0",
+    "Pillow>=10.1",
     "imagehash>=4.3",
     "json-repair>=0.30",
     "numpy>=1.26",
     "ortools==9.15.6755",
     "rich>=13.7",
+    "shapely==2.2.0",
 ]
 
 [project.scripts]

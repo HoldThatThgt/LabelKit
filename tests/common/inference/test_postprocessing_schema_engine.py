@@ -7,7 +7,7 @@ import pytest
 
 from labelkit.common.config.model import OutputConfig
 from labelkit.common.contracts.types import Usage
-from labelkit.common.errors import PostprocessorError
+from labelkit.common.errors import PostprocessorError, SchemaViolation
 from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.extensions.postprocessing import invoke_postprocessor
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
@@ -260,3 +260,37 @@ def test_postprocessor_error_on_repair_candidate_is_terminal_and_unwrapped(caplo
     assert "secret exception text" not in caplog.text
     assert "reason=exception" in caplog.text
     assert "/safe/hooks.py:complete" in caplog.text
+
+
+def test_region_reference_check_sits_between_model_l2_and_finalizer():
+    """层位：模型 L2 违规轮既不查引用也不调函数；引用违规轮不调函数；合格候选恰一次调用。"""
+    calls = []
+
+    def finalizer(candidate):
+        calls.append(candidate["payload"]["label"])
+        return {"payload": {"label": candidate["payload"]["label"], "derived": 1}}
+
+    llm = _QueueLLM({"payload": {"label": 7}}, {"payload": {"label": "ghost-3"}}, {"payload": {"label": "r1"}})
+    engine = SchemaEngine(MODEL_SCHEMA, llm, OutputConfig(max_repair_attempts=2))
+    scope = CallScope(region_ids=frozenset({"r1"}), region_ref_paths=("/payload/label",))
+    obj, _usage, attempts, _model = asyncio.run(engine.complete_finalized(_request(finalizer, scope=scope)))
+    assert obj == {"payload": {"label": "r1", "derived": 1}} and attempts == 3
+    assert calls == ["r1"]
+    repair_texts = ["\n".join(part.text for message in prompt.messages for part in message.parts)
+                    for prompt in llm.prompts]
+    assert "unknown region reference" not in repair_texts[1]
+    assert "/payload/label: unknown region reference" in repair_texts[2]
+    assert "ghost-3" not in repair_texts[2].split("/payload/label: unknown region reference")[1]
+
+
+def test_region_reference_violation_exhausts_as_schema_violation_without_final_call():
+    def finalizer(_candidate):
+        raise AssertionError("finalizer must not run for an unknown reference")
+
+    llm = _QueueLLM({"payload": {"label": "ghost-3"}}, {"payload": {"label": "ghost-3"}})
+    engine = SchemaEngine(MODEL_SCHEMA, llm, OutputConfig(max_repair_attempts=1))
+    scope = CallScope(region_ids=frozenset({"r1"}), region_ref_paths=("/payload/label",))
+    with pytest.raises(SchemaViolation) as caught:
+        asyncio.run(engine.complete_finalized(_request(finalizer, scope=scope)))
+    assert caught.value.errors == ["/payload/label: unknown region reference"]
+    assert caught.value.callback_only is False

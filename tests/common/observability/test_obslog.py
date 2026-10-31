@@ -398,6 +398,7 @@ def test_v18_event_constants_exact_strings():
     assert obslog.EV_INGEST_DISORDER == "ingest.disorder"
     assert obslog.EV_SEGMENT_SESSION == "segment.session"
     assert obslog.EV_SEGMENT_BOUNDARY == "segment.boundary"
+    assert obslog.EV_SEGMENT_REGIONS == "segment.regions"      # v1.22 M14 图片模式
     assert obslog.EV_EXTRACT_STEP == "extract.step"
 
 

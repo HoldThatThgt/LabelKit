@@ -19,6 +19,7 @@ import json
 import hashlib
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
@@ -27,6 +28,11 @@ from urllib.parse import urlsplit
 import json_repair
 from jsonschema import Draft202012Validator
 
+from labelkit.common.contracts.post_validation import (
+    PostValidatedCallRequest,
+    PostValidationResult,
+    ValidatedPostCall,
+)
 from labelkit.common.contracts.types import Usage
 from labelkit.common.errors import (
     LabelKitError,
@@ -405,6 +411,32 @@ def segment_window_schema(frame_count: int, with_reason: bool) -> dict:
             "required": ["frames"], "additionalProperties": False}
 
 
+def segment_image_schema() -> dict:
+    """v1.22 M14 图片模式（CONTRACTS §10.7）：一个样本的候选区域，坐标为 0–1000 网格整数。
+
+    全部键必填、可空用联合类型；``box_id`` 与 ``polygons`` 恰好一个非空在严格安全子集里表达不了，
+    由 ``segment_geometry.validate_regions`` 检查。环只构造一次，在外环与内环两处引用。
+
+    @return draft 2020-12 Schema 对象。
+    """
+    ring = {"type": "array", "minItems": 4, "items": {
+        "type": "array", "minItems": 2, "maxItems": 2,
+        "items": {"type": "integer", "minimum": 0, "maximum": 1000}}}
+    return {"type": "object", "additionalProperties": False, "required": ["regions"],
+            "properties": {"regions": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["box_id", "polygons", "source_box_ids"],
+                "properties": {
+                    "box_id": {"type": ["string", "null"]},
+                    "polygons": {"type": ["array", "null"], "minItems": 1, "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["exterior", "holes"],
+                        "properties": {"exterior": ring,
+                                       "holes": {"type": "array", "items": ring}}}},
+                    "source_box_ids": {"type": ["array", "null"],
+                                       "items": {"type": "string"}}}}}}}
+
+
 def action_schema() -> dict:
     """v1.8 M15（spec 3.15.3 / CONTRACTS §10.7）：相邻帧对的单条动作判决。
 
@@ -732,6 +764,8 @@ class CallScope:
     repair_context_bytes: int | None = None  # 当前调用单轮新增 L3 正文 byte 上限
     complete_evidence: bool = False     # 修复保留原完整证据；容量错误交还所属算子
     retain_repair_prompt: bool = False  # 修复保留首轮提示词；容量错误仍按普通路径处理
+    region_ids: frozenset[str] | None = None  # v1.22 同一 RegionSet 的候选 id；None 不检查引用
+    region_ref_paths: tuple[str, ...] = ()    # v1.22 x-labelkit-region-ref 路径，数组项写 *
 
 
 _DEFAULT_SCOPE = CallScope()
@@ -777,6 +811,8 @@ class _CallContext:
     repair_context_bytes: int | None = None  # 单轮新增 L3 正文 byte 上限
     complete_evidence: bool = False  # 修复容量错误是否交还所属算子
     original_prompt: PromptBundle | None = None  # 修复时原样重放的首轮提示词
+    region_ids: frozenset[str] | None = None  # 本样本的候选 id；None 不检查引用
+    region_ref_paths: tuple[str, ...] = ()    # 引用检查的路径
 
 
 @dataclass(frozen=True)
@@ -819,7 +855,7 @@ class _PostInspection:
 
     rendered: list[str]             # 可进入 L3 的违规文本
     summaries: list[str]            # trace 使用的脱敏摘要
-    execution: object | None        # 唯一成功执行证明
+    proof: object | None            # 成功时非空的证明对象
     terminal_kind: str | None       # invalid/exception 终态分类
 
 
@@ -882,8 +918,6 @@ def _normalize_post_result(result: object) -> _PostInspection:
     @param result 后置验证器原始返回值
     @return 成功证明、可修复违规或 invalid 终态
     """
-    from labelkit.common.contracts.generation import EventExecution, PostValidationResult
-
     if not isinstance(result, PostValidationResult):
         return _PostInspection([], [], None, "post_validator_invalid")
     violations = result.violations
@@ -891,9 +925,9 @@ def _normalize_post_result(result: object) -> _PostInspection:
         isinstance(item, str) and bool(item.strip()) for item in violations)
     if not valid_strings:
         return _PostInspection([], [], None, "post_validator_invalid")
-    if not violations and isinstance(result.event_execution, EventExecution):
-        return _PostInspection([], [], result.event_execution, None)
-    if violations and result.event_execution is None:
+    if not violations and result.proof is not None:
+        return _PostInspection([], [], result.proof, None)
+    if violations and result.proof is None:
         rendered = [_POST_PREFIX + item for item in violations]
         summaries = ["post-validator" for _ in violations]
         return _PostInspection(rendered, summaries, None, None)
@@ -986,6 +1020,40 @@ def _repair_previous_output(
     return rendered
 
 
+def _region_values(value: object, tokens: list[str], pointer: str) -> Iterator[tuple[str, object]]:
+    """沿冻结路径取实例值；缺失的可选字段与 null 父节点直接跳过。
+
+    @param value 当前实例节点
+    @param tokens 剩余路径片段，``*`` 只匹配数组
+    @param pointer 当前节点的具体 JSON Pointer
+    @return (具体 JSON Pointer, 值) 的迭代器
+    """
+    if not tokens:
+        yield pointer, value
+    elif isinstance(value, list) and tokens[0] == "*":
+        for index, item in enumerate(value):
+            yield from _region_values(item, tokens[1:], f"{pointer}/{index}")
+    elif isinstance(value, Mapping):
+        key = tokens[0].replace("~1", "/").replace("~0", "~")
+        if key in value:
+            yield from _region_values(value[key], tokens[1:], f"{pointer}/{tokens[0]}")
+
+
+def _region_violations(obj: Mapping[str, object], ctx: _CallContext) -> list[str]:
+    """L2 通过后的引用检查：未知值可修复且绝不回显，null 跳过。
+
+    @param obj 已过模型 Schema L2 的候选
+    @param ctx 本次调用的不变上下文
+    @return 按指针确定序的渲染违规；``region_ids`` 为 None 时恒空
+    """
+    if ctx.region_ids is None:
+        return []
+    return sorted(f"{pointer}: unknown region reference"
+                  for path in ctx.region_ref_paths
+                  for pointer, value in _region_values(obj, path.split("/")[1:], "")
+                  if value is not None and value not in ctx.region_ids)
+
+
 def _finalized_context(request: FinalizedCallRequest) -> _CallContext:
     """从公开请求构造 model Schema 调用上下文。
 
@@ -1002,6 +1070,8 @@ def _finalized_context(request: FinalizedCallRequest) -> _CallContext:
         repair_context_bytes=scope.repair_context_bytes,
         complete_evidence=scope.complete_evidence,
         original_prompt=(request.prompt if scope.complete_evidence or scope.retain_repair_prompt else None),
+        region_ids=scope.region_ids,
+        region_ref_paths=scope.region_ref_paths,
     )
 
 
@@ -1127,6 +1197,10 @@ class SchemaEngine:
         if obj is None:
             return [_UNPARSEABLE_VIOLATION], [_UNPARSEABLE_SUMMARY]
         rendered, summaries = self._validate_full(obj, ctx.active)
+        if not rendered:
+            references = _region_violations(obj, ctx)                # v1.22 引用检查，先于 L2.5
+            if references:
+                return references, list(references)
         if not rendered and ctx.user_treated and self._validator is not None:
             cb = self._callback_violations(obj, ctx.record)          # L2.5
             return cb, list(cb)
@@ -1186,7 +1260,8 @@ class SchemaEngine:
             batch_no=scope.batch_no, record=scope.record,
             repair_context_bytes=scope.repair_context_bytes,
             complete_evidence=scope.complete_evidence,
-            original_prompt=(prompt if scope.complete_evidence or scope.retain_repair_prompt else None))
+            original_prompt=(prompt if scope.complete_evidence or scope.retain_repair_prompt else None),
+            region_ids=scope.region_ids, region_ref_paths=scope.region_ref_paths)
         # L0：Schema 恒交给客户端；仅当 profile 声明 supports_structured_output 时，
         # 客户端才施加厂商结构化输出机制。
         response = await self._llm.complete(profile, prompt, response_schema=ctx.active)
@@ -1206,7 +1281,7 @@ class SchemaEngine:
         request: FinalizedCallRequest,
         ctx: _CallContext,
     ) -> _FinalizedInspection:
-        """按 model L2、finalizer、full L2、L2.5 的固定顺序检查候选。
+        """按 model L2、引用检查、finalizer、full L2、L2.5 的固定顺序检查候选。
 
         @param candidate L1 归一的 model-space 对象。
         @param request 冻结的 generic finalizer 请求。
@@ -1221,6 +1296,9 @@ class SchemaEngine:
         rendered, summaries = self._validate_full(candidate, ctx.active)
         if rendered:
             return _FinalizedInspection(None, rendered, summaries)
+        references = _region_violations(candidate, ctx)              # v1.22 引用检查，先于 finalizer
+        if references:
+            return _FinalizedInspection(None, references, list(references))
         finalized = _mapping_transform(
             request.candidate_finalizer, candidate, "candidate_finalizer")
         try:
@@ -1309,11 +1387,11 @@ class SchemaEngine:
     async def complete_post_validated(
         self,
         request: PostValidatedCallRequest,
-    ) -> ValidatedGenerationCall:
-        """对每个 L2 候选恰验证一次并返回匹配的执行证明。
+    ) -> ValidatedPostCall:
+        """对每个 L2 候选恰验证一次并返回匹配的成功证明。
 
         @param request 含 request-local 后置验证器的完整调用请求
-        @return 已验证对象及该同一候选的执行证明
+        @return 已验证对象及该同一候选的成功证明
         """
         active = _thaw_json(request.schema)
         ctx = _CallContext(active=active, user_treated=False,
@@ -1326,13 +1404,11 @@ class SchemaEngine:
         inspected = _inspect_post_candidate(obj, active, request.post_validator)
         if inspected.terminal_kind is not None:
             _raise_post_terminal(inspected.terminal_kind)
-        if obj is not None and inspected.execution is not None:
-            from labelkit.common.contracts.generation import ValidatedGenerationCall
-
+        if obj is not None and inspected.proof is not None:
             bucket = _bucket_for(l1_fixed, 0)
             self._resolve(bucket, ctx, violations=[])
-            return ValidatedGenerationCall(obj, inspected.execution, bucket,
-                                           response.usage, 1, response.model)
+            return ValidatedPostCall(obj, inspected.proof, bucket,
+                                     response.usage, 1, response.model)
         pending = _PostPending(raw, inspected.rendered, inspected.summaries,
                                response.usage, response.model, 1)
         return await self._repair_post_validated(request, ctx, pending)
@@ -1342,14 +1418,14 @@ class SchemaEngine:
         request: PostValidatedCallRequest,
         ctx: _CallContext,
         pending: _PostPending,
-    ) -> ValidatedGenerationCall:
+    ) -> ValidatedPostCall:
         """在完整 Schema 与纯违规文本上执行最多两轮 L3。
 
         @param request 原始 post-validated 请求
         @param ctx 内部待遇调用上下文
         @param pending 首轮未通过现场
-        @return 成功候选及同一次后置执行证明
-        @raises SchemaViolation 修复预算耗尽或 post-validator 终态
+        @return 成功候选及同一次后置验证的成功证明
+        @raises SchemaViolation 修复预算耗尽（携带累计用量）或 post-validator 终态
         """
         raw, rendered, summaries = pending.raw, pending.rendered, pending.summaries
         usage, attempts = pending.usage, pending.attempts
@@ -1365,15 +1441,13 @@ class SchemaEngine:
             inspected = _inspect_post_candidate(obj, schema, request.post_validator)
             if inspected.terminal_kind is not None:
                 _raise_post_terminal(inspected.terminal_kind)
-            if obj is not None and inspected.execution is not None:
-                from labelkit.common.contracts.generation import ValidatedGenerationCall
-
+            if obj is not None and inspected.proof is not None:
                 bucket = f"l3_{repair_round}"
                 self._resolve(bucket, ctx, violations=summaries)
-                return ValidatedGenerationCall(obj, inspected.execution, bucket, usage,
-                                               attempts, pending.model)
+                return ValidatedPostCall(obj, inspected.proof, bucket, usage,
+                                         attempts, pending.model)
             rendered, summaries = inspected.rendered, inspected.summaries
-        raise SchemaViolation(rendered, raw)
+        raise SchemaViolation(rendered, raw, usage=usage)
 
     async def _post_repair_call(self, repair: _PostRepairRequest):
         """执行一轮 post-validated L3 调用并归一 overflow 短路。
@@ -1467,10 +1541,3 @@ class SchemaEngine:
             )
             feed_reactive_terminal(overflow, self._metrics)
             return None
-
-
-# 公开签名的运行期注解绑定；载体模块同时把 SchemaEngine 注回自身命名空间。
-from labelkit.common.contracts.generation import (  # noqa: E402
-    PostValidatedCallRequest,
-    ValidatedGenerationCall,
-)

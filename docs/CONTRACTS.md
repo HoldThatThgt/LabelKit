@@ -2,18 +2,63 @@
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
 M1–M17 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
-v1.21 sequence-interleaving revision (`spec/*.md`,
-`docs/dev/SPEC-sequence-generation-redesign.md`, `docs/dev/SPEC-execution-runtime.md` and
-`docs/dev/SPEC-sequence-temporal-integrity.md`, `docs/dev/SPEC-sequence-interleaving.md`). Those
+v1.22 image-region-segmentation revision (`spec/*.md`,
+`docs/dev/SPEC-sequence-generation-redesign.md`, `docs/dev/SPEC-execution-runtime.md`,
+`docs/dev/SPEC-sequence-temporal-integrity.md`, `docs/dev/SPEC-sequence-interleaving.md` and
+`docs/dev/SPEC-image-region-segmentation.md`). Those
 documents remain the authority for *algorithms and behavior*; this document is the authority for
 *names, signatures, types, defaults, file formats, and prompt text*. Where a spec left a signature
 or format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions
 are also listed in §12). Any deviation requires editing this file first.
 
+## Image region segmentation contract — 2026-10-31 (v1.22)
+
+`docs/dev/SPEC-image-region-segmentation.md` is the authoritative image-mode revision; its decision
+record is `docs/dev/PROPOSAL-image-region-segmentation.md` (all fifteen decisions D1–D15 closed).
+It applies to `run.mode="process"`, `run.modality="ui"`, `segment.enabled=true` and
+`segment.mode="image"`, and adds to the sections named below. Text, UI, stream and generation
+projects keep byte-identical prompts, outputs, reports, goldens and counts. Label: v1.22 (D8).
+
+`segment.enabled` no longer means stream mode. It is only the stage switch. `segment.mode =
+"image" | "sequence"` is required whenever the switch is on, with no default and no alias; a
+project enabling segment without `mode` is a CONFIG_ERROR (rule 72), and existing stream projects
+add `mode = "sequence"` with no migration or fallback. Every stream meaning keys on the frozen parse
+product `segment.sequence_resolved = enabled ∧ mode == "sequence"`. Stage-in-chain judgments keep
+`segment.enabled`; `build_stages` selects the class by mode. Reference, vision, repair and budget
+sets evaluate `enabled` plus `mode` separately, chiefly through `SegmentConfig.llm_referenced`.
+Wherever this document still writes `segment.enabled`, it means the switch alone, and "stream mode",
+"stream" and "process stream" mean `segment.sequence_resolved`.
+
+Division of labor: segment decides geometry, annotate selects and labels by `region_id` only,
+post-processing performs deterministic reference resolution and format conversion. One image is
+one sample. The model sees a 0–1000 integer grid (D3); the only geometry truth is original-image
+pixel coordinates, never rounded; the canvas is the stored pixel grid and EXIF orientation is
+neither read, applied nor rejected (D4). Candidates come from exactly three routes: `instruction`
+alone (the model sees the image), `instruction` plus `box_parser` (the model also sees reference
+boxes), or `box_parser` alone (reference boxes become rectangular candidates with no model call and
+no runtime task, D15). LabelKit never parses a UI tree in image mode and never sniffs companion
+content: registering the hook is the project's declaration, and the hook's validated output is the
+only trusted structure (D13, D14).
+
+The frozen surface is: dependency whitelist (ground rules); §1 layout and test ownership; §3
+carriers and id rule; §3.1 `regions.py`; §4 `BoxParserError`, `companion_invalid`,
+`SchemaViolation.usage`; §6.1 `SegmentConfig`; §6.3 rules 17/29/33/34 and 72–81; §6.4 hook surfaces;
+§7.1 discovery; §7.2 dedup; §7.4 and §7.6 prompt options and helpers; §7.7 generic post-validation
+seam and `x-labelkit-region-ref`; §7.8 `Part.image`; §7.9 gates and estimates; §7.10 `_meta.regions`;
+§7.11 and §8.1 `segment.regions`; §7.12 reference sets and stage selection; §7.13 fan-out;
+§7.17 `segment_image`; §7.20 stage interface; §9.1–§9.3 outputs; §10.1/§10.2/§10.3/§10.5/§10.8
+variants; §10.6.1 generic repair dialogue; §10.7 `segment_image_schema()`; §10.20 prompt; §12 #37.
+
+§9.4 and §11 are unchanged (D1): the overlay is rendered lazily per request and discarded, nothing
+is written to disk, no output channel is added, and no run can reproduce the overlay bytes a model
+saw. `_meta.regions` is the verifiable evidence. Real-endpoint evidence comes only from z.ai glm-5.2
+(D7) and stays `[PENDING-EVIDENCE:<name>]` in `docs/dev/E2E-FINDINGS.md` until actually run; offline
+results never replace it.
+
 ## Process sequence context capacity contract — 2026-09-09
 
 `docs/dev/SPEC-sequence-context-capacity.md` is the authoritative process-stream revision.
-For `run.mode="process"` with `segment.enabled=true`, this section replaces batch-lifetime,
+For `run.mode="process"` with `segment.sequence_resolved=true`, this section replaces batch-lifetime,
 hard-split, sequence sampling, content-ID member addressing and immediate downstream commit clauses below.
 Ordinary records and sequence generation retain their own execution and identity contracts.
 Superseded process-stream wording is removed as part of the same implementation/documentation change.
@@ -124,8 +169,11 @@ Ground rules for every implementer:
   only: lazily imported inside `labelkit/cli/console.py`, the sole touchpoint (operators/common
   never import it; M1 probes importability via `find_spec` without importing); v1.18 retains the
   narrow algorithm-library exception `ortools==9.15.6755`, imported only by
-  `labelkit/operators/generation/planner.py`. Nothing else. OR-Tools is not an application
-  framework, and there is no runtime substitute or version fallback.
+  `labelkit/operators/generation/planner.py`; v1.22 adds the same narrow algorithm-library
+  exception `shapely==2.2.0` (exact pin, GEOS ships in the wheel), whose sole production import
+  point is `labelkit/operators/segment_geometry.py`, and raises the Pillow floor to `Pillow>=10.1`
+  (`ImageFont.load_default(size=...)`). Nothing else. OR-Tools and Shapely are not application
+  frameworks, and there is no runtime substitute or version fallback.
 - Code identifiers: English. **Comments and docstrings: Chinese** (the 2026-08-14 code-rule
   remediation — see §12 and spec §1.6). **Everything a user or a machine reads — log lines, error
   messages, CLI output, exception text, report/trace payloads: English.** LLM prompt templates are
@@ -136,7 +184,12 @@ Ground rules for every implementer:
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
 - Import discipline (no cycles): production imports use only the layered package paths below.
   `labelkit.common.contracts.types` and `labelkit.common.errors` import
-  nothing from `labelkit`; `labelkit.common.config.model` imports nothing from `labelkit` except
+  nothing from `labelkit`; v1.22: `labelkit.common.contracts.regions` imports only
+  `labelkit.common.contracts.types` (one-way: `types.py` names `RegionSet` under
+  `typing.TYPE_CHECKING` only) and imports Pillow inside functions;
+  `labelkit.common.contracts.post_validation` names `PromptBundle`, `CallScope` and `Usage` under
+  `typing.TYPE_CHECKING` only and never imports `llm_client` or `schema_engine` at runtime;
+  `labelkit.common.config.model` imports nothing from `labelkit` except
   shared contract types if needed. `labelkit.common.inference.llm_client` imports only common-layer
   contracts, errors, config, observability and the sibling `labelkit.common.inference.budget`;
   `labelkit.common.inference.schema_engine` imports the inference LLM client plus common
@@ -198,7 +251,9 @@ labelkit/
 │   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
 │   │   ├── stage.py                    # Stage protocol and RunContext
 │   │   ├── execution.py                # v1.19 TaskSpec/TaskExecutor/ResourceLimiter contracts
-│   │   └── generation.py               # v1.18 generation program/trace/request/result contracts
+│   │   ├── generation.py               # v1.18 generation program/trace/request/result contracts
+│   │   ├── post_validation.py          # v1.22 neutral M8 post-validation carriers (§7.7)
+│   │   └── regions.py                  # v1.22 candidate carriers, overlay reference and rendering, JSON projection (§3.1)
 │   ├── errors.py                       # cross-layer error vocabulary, exit codes, ErrorKind
 │   ├── config/
 │   │   ├── __init__.py                 # exports load/default_rubric/ResolvedConfig/parse_generation_config only
@@ -213,6 +268,7 @@ labelkit/
 │   │   ├── _postprocessing.py          # 标注后处理配置、完整示例与模型投影
 │   │   ├── _generation_budget.py       # v1.18 sequence content limits and six-family budget proof
 │   │   ├── _sequence_layout.py         # v1.21 timeline/interleaving parse and derived-count closure
+│   │   ├── _segment_image.py           # v1.22 image-mode configuration rules 72–81 (§6.3)
 │   │   └── generation.py                # current sequence-generation public carriers and parser entry
 │   ├── inference/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
@@ -224,11 +280,15 @@ labelkit/
 │   │   ├── obslog.py                   # M12 logs, trace, events, metrics, breaker state
 │   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen (re-frozen 2026-08-14 onto the English strings)
 │   └── extensions/
+│       ├── box_parser.py               # v1.22 box_parser signature check, invocation, strict JSON copy, reference-box validation (§6.4)
 │       ├── hooks.py                    # user validator resolution/execution/normalization
 │       └── postprocessing.py           # 同步后处理装载、严格 JSON 调用及 Schema/实例投影
 ├── operators/
 │   ├── ingest.py                       # M2
+│   ├── ingest_image.py                 # M2 image-mode discovery, companion read, header check, digests (§7.1)
 │   ├── segment.py                      # M14
+│   ├── segment_image.py                # M14 image-mode stage, prompts, candidate routes, failure classification (§7.20)
+│   ├── segment_geometry.py             # M14 sole Shapely import point: geometry checks, projection, numbering (§7.20)
 │   ├── stitch.py                       # M16
 │   ├── dedup.py                        # M3
 │   ├── classify.py                     # M13
@@ -268,7 +328,8 @@ labelkit/
 ```
 
 `labelkit/common/errors.py`, `labelkit/common/contracts/types.py`,
-`labelkit/common/contracts/stage.py`, `labelkit/common/contracts/execution.py`, and
+`labelkit/common/contracts/stage.py`, `labelkit/common/contracts/execution.py`,
+`labelkit/common/contracts/regions.py`, and
 `labelkit/common/config/model.py` are the canonical homes
 of the verbatim frozen material in sections 3–6. Changes to their frozen content still require
 updating this file first.
@@ -288,7 +349,9 @@ console-script target `labelkit.cli:main` remains unchanged. Public direct-call 
 (the four sanctioned stream-repair calls), `RunContext`,
 `TaskExecutor`, `LLMClient`, and `SchemaEngine` exist only at their canonical layered paths.
 `quality.py` with `quality_calls.py` is one M4 operator; `verify.py` with `stream_verify.py` is one
-M7 operator. Imports inside either physical pair do not create a cross-operator dependency.
+M7 operator; v1.22: `segment.py`, `segment_capacity.py`, `segment_image.py` and `segment_geometry.py`
+are one M14 operator, and `ingest.py` with `ingest_image.py` is one M2 operator. Imports inside any
+such physical family do not create a cross-operator dependency.
 
 ### 1.2 Test ownership
 
@@ -317,7 +380,20 @@ project behavior in `tests/operators/generation/`; transactional delivery in
 `test_evaluate.py`, and `test_project.py`; the CLI golden is
 `tests/cli/goldens/dryrun-sequence-generation.txt`. Integration tests use the
 real DeepSeek and z.ai routes prescribed by the repository guidance; no mock LLM transport is
-introduced. Existing seam coverage remains with `test_config.py`, `test_paths_hooks.py`,
+introduced. v1.22 image-segmentation coverage mirrors its production owners: configuration in
+`tests/common/config/test_segment_mode_config.py`; carriers and overlay in
+`tests/common/contracts/test_regions.py`, `test_region_overlay.py` and `test_post_validation.py`; hook
+contract in `tests/common/extensions/test_box_parser.py`; the M8 seam and reference check in
+`tests/common/inference/test_post_validation_seam.py` and `test_region_ref_engine.py`; operators in
+`tests/operators/test_ingest_image.py`, `test_segment_geometry.py`, `test_segment_image.py`,
+`test_annotate_image.py`, `test_verify_image.py`, `test_image_bypass.py`, `test_dedup_image.py`,
+`test_emitter_image.py`, `test_region_context.py` and `test_image_examples.py`; orchestration in
+`tests/orchestration/test_segment_mode_rekey.py` and `test_image_workflow.py`; the CLI in
+`tests/cli/test_image_cli.py` with goldens `tests/cli/goldens/dryrun-image-model.txt` and
+`dryrun-image-boxes.txt`; real endpoints in `tests/integration/test_segment_image_llm.py` (marker
+`zai`); the closure gate over acceptance rows, deferral markers, evidence, rekey, documents, scope and
+limits in `tests/common/contracts/test_image_region_closure.py`. Offline tests use in-process engine stubs at the `complete_*` seam. Existing seam coverage
+remains with `test_config.py`, `test_paths_hooks.py`,
 `test_types.py`, `test_hooks.py`, `test_budget.py`, `test_credentials.py`,
 `test_generation_prompts.py`,
 `test_schema_engine.py`, `test_dedup.py`, `test_quality.py`, `test_annotate.py`,
@@ -386,14 +462,20 @@ flowchart LR
 segment, stitch and extract are DEFAULT OFF; with all three disabled the process chain degrades
 byte-identically to the v1.7 chain
 `dedup → classify → quality → generate → annotate → verify → emit`. `generate.enabled` and
-`segment.enabled` are mutually exclusive (M1, the segment-precondition rule — §6.3 rule 29) and
-`stitch.enabled` requires `segment.enabled` (the stitch-requires-segment rule, §6.3 rule 37), so
+`segment.enabled` (the stage switch, in both `segment.mode` values) are mutually exclusive (M1, the
+segment-precondition rule — §6.3 rule 29) and
+`stitch.enabled` requires `segment.sequence_resolved` (the stitch-requires-segment rule, §6.3 rule 37), so
 the generate slot never coexists with the stream stages (stitch included) and stitch never
 appears in the generation re-flow chain. Generation sub-batches run the re-flow chain above
 (generated records enter carrying an `"inherited"` Classification, which the idempotent
 classify stage skips — §7.13). In `generate_only` mode, classify/quality/annotate are
 individually optional per switches; segment/stitch/extract never participate — segment requires
-process mode and stitch requires segment, §6.3.
+process mode and stitch requires `segment.sequence_resolved`, §6.3.
+
+v1.22: `segment.mode` selects what occupies the segment slot. With `mode = "image"`,
+`SegmentImageStage` (§7.20) runs at the same chain head on the ordinary batch path, the chain tuple
+is unchanged (D2), and stitch, extract, the frame passes and session routing are unavailable
+(§6.3 rule 76). With the switch on, the segment precondition rule applies to both modes.
 
 Statuses: `active | dropped_dup | dropped_lowq | dropped_verify | failed | absorbed |
 dropped_noise | stitched` (EIGHT values; `absorbed`/`dropped_noise` are v1.8: `absorbed` =
@@ -414,7 +496,10 @@ import base64
 import io
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
+
+if TYPE_CHECKING:
+    from labelkit.common.contracts.regions import RegionSet    # v1.22; one-way, §3.1
 
 Status = Literal[
     "active",          # alive, keeps flowing
@@ -446,6 +531,17 @@ class RecordRef:
                                            # non-generated records: None
 
 
+def scaled_size(width: int, height: int, max_px: int) -> tuple[int, int]:
+    """按长边上限计算逐轴缩放尺寸；ImageRef.load_base64 与叠图渲染共用。
+
+    @param width 原图宽。
+    @param height 原图高。
+    @param max_px 长边上限。
+    @return 长边不超限时原样返回；否则 (max(1, round(width * s)), max(1, round(height * s)))，s = max_px / 长边。
+    """
+    ...
+
+
 @dataclass(frozen=True)
 class ImageRef:
     path: Path
@@ -455,7 +551,12 @@ class ImageRef:
     def load_base64(self, max_px: int) -> tuple[str, str]:
         """Load from disk at call time. If the longer edge exceeds max_px, downscale
         proportionally (Pillow) before encoding. Returns (media_type, b64) where media_type is
-        "image/png" | "image/jpeg". Bytes are not cached — used and discarded (spec §2.6)."""
+        "image/png" | "image/jpeg". Bytes are not cached — used and discarded (spec §2.6).
+        v1.22: the target size comes from scaled_size (bytes unchanged). Without a downscale the
+        pixels are still decoded to detect truncation, and the original file bytes are returned
+        unchanged. Any Pillow decode failure (PIL.Image.DecompressionBombError, and the SyntaxError
+        or ValueError its PNG decoder raises on damaged chunks) is re-raised as OSError so the
+        existing image_decode_error classification covers it."""
         ...
 
 
@@ -529,12 +630,22 @@ class Record:
     exact_dedup_text: str | None = None     # v1.20 generation stream only: M2-verified payload
                                            # after removing all declared business-time paths;
                                            # ordinary ingest paths keep None
+    companion: bytes | None = None         # v1.22 image mode: companion file raw bytes, never decoded
+                                           # or interpreted; None without box_parser or file
+    companion_path: str | None = None      # v1.22 image mode: companion path string, the same form
+                                           # as str(record.image.path); None without a file
+    image_sha256: str | None = None        # v1.22 image mode: full lowercase hex, written by M2
+    companion_sha256: str | None = None    # v1.22 image mode: full lowercase hex; None without a file
 ```
 
 **Record id rules (M2/M6/M14, normative):**
 - text modality: `sha256(canonical_json(raw).encode("utf-8")).hexdigest()[:16]` where
   `canonical_json(x) = json.dumps(x, sort_keys=True, ensure_ascii=False, separators=(",", ":"))`.
 - UI modality: `sha256(uitree_file_bytes + image_file_bytes).hexdigest()[:16]`.
+- UI modality with `segment.mode = "image"` (v1.22):
+  `sha256(companion_bytes + image_bytes).hexdigest()[:16]`, with `companion_bytes = b""` when there
+  is no companion file or no `box_parser` is registered. An absent and a zero-byte companion file
+  therefore share one id; the zero-byte file still calls the hook.
 - generated records (M6): `raw = {input.text_field: sample_text}`, then the text rule.
 - process sequence records: `process_sequence_id(session_id, member_positions, member_ids)`
   over the session, occurrence positions and member ids in order-key ascending order, fixed at episode formation — M7 member
@@ -685,6 +796,11 @@ class PipelineItem:                        # mutable envelope; ordinary batch or
                                            # irreparably (failed 占键为 None, skipped 不占键 —
                                            # the dict shape is the single source of truth for
                                            # the members[] status三值); clones share by reference
+    regions: RegionSet | None = None       # v1.22 additive: written by SegmentImageStage (§7.20).
+                                           # None = image segmentation did not run or failed;
+                                           # RegionSet(regions=()) = legal empty candidates; the two
+                                           # are never interchanged. Fan-out clones share it by
+                                           # reference (classify._fan_out, §7.13)
 
 
 # ── v1.8 shared frame helpers (spec §4.3, S12/S13) ──────────────────────────
@@ -758,10 +874,125 @@ Notes binding on all implementers:
   renders it as `_meta.stream.fragments`, §9.1). A fourth, frame-level audit mark
   `rescued_by = <surviving thread record.id>` is stamped on rescue-flipped frames next to
   their retained `noise_attribution` — trace/audit only, never emitted to any output channel.
+- v1.22 additive fields (SPEC-image-region-segmentation §4, same appended-with-defaults
+  construction): `Record.companion`/`companion_path`/`image_sha256`/`companion_sha256` and
+  `PipelineItem.regions`. All five keep their defaults outside image mode. An image-mode Record has
+  `ui_tree = None`, `raw = None`, an `ImageRef` image and `modality = "ui"`; `RecordRef.source_file`
+  is the image path, `pair_index` the index and `line_no = None`. `Record.exact_dedup_text` is not
+  borrowed: setting it would select exact-only dedup and skip the pHash layer.
 - `frame_digest`/`tree_diff` are v1.8 module-level helpers whose docstrings above are the
   behavior contract (spec §4.3 末段); M14/M15/M13/M4 consume them — never re-implement
   digest/diff logic inside an operator module.
 - Everything except `PipelineItem` is `frozen=True`. No module mutates a `Record`.
+
+### 3.1 `labelkit/common/contracts/regions.py` — verbatim (v1.22)
+
+The carriers hold only int, float, str and tuple and are deeply immutable, so they do not reuse
+`contracts/generation.py`'s `_ImmutableCarrier` (that module imports `llm_client` and `schema_engine`).
+
+```python
+@dataclass(frozen=True)
+class ReferenceBox:
+    """box_parser 钩子返回并经框架校验的一个参考框（原图像素，仅轴对齐矩形，D14）。"""
+
+    box_id: str                                        # 钩子给出的框名，全部留空时由框架按数组顺序补为 "1"…"N"
+    bbox: tuple[int | float, int | float, int | float, int | float]  # (l, t, r, b)，保留钩子给出的数值类型
+    text: str                                          # 钩子给模型看的描述，可为空
+
+
+@dataclass(frozen=True)
+class RegionPolygon:
+    """单个多边形部件：原图像素闭环外环与零到多个闭环内环。"""
+
+    exterior: tuple[tuple[int | float, int | float], ...]  # 闭环：≥4 个位置，首末相同
+    holes: tuple[tuple[tuple[int | float, int | float], ...], ...]  # 每个内环同样是闭环
+
+
+@dataclass(frozen=True)
+class CandidateRegion:
+    """一个候选区域：区域标识（框名或框架编号 r<n>）、几何部件、来源参考框与叠图标注点。"""
+
+    region_id: str                                     # 来自参考框：框名；模型新画：框架按出现顺序编号 r1, r2, …
+    polygons: tuple[RegionPolygon, ...]                # 1 个 = Polygon；多个 = MultiPolygon
+    box_id: str | None                                 # 几何取自哪个参考框（复用或 D15 直通）；模型画的多边形为 None
+    source_box_ids: tuple[str, ...]                    # 没有参考框时恒为空；box_id 非空时恒为 (box_id,)
+    label_anchor: tuple[float, float]                  # 原图像素点，仅用于渲染，不是几何真值
+
+
+@dataclass(frozen=True)
+class RegionSet:
+    """一个样本的完整分割结果；regions 为空元组表示合法的空候选。"""
+
+    width: int                                         # 原图存储像素宽（Pillow 只读文件头）
+    height: int
+    boxes: tuple[ReferenceBox, ...]                    # 未注册钩子或无伴随文件时为空
+    regions: tuple[CandidateRegion, ...]
+
+
+@dataclass(frozen=True)
+class RegionOverlayRef:
+    """原图加候选的惰性叠图引用；与 ImageRef 共享 load_base64 接口。"""
+
+    base: ImageRef
+    regions: RegionSet
+
+    def load_base64(self, max_px: int) -> tuple[str, str]:
+        """按与 base 相同的逐轴缩放渲染叠图，字节不保留。
+
+        @param max_px 本次请求的长边像素上限。
+        @return (media_type, b64)，media_type 恒为 image/png。
+        @raises OSError 文件不可读或 Pillow 解码失败（DecompressionBombError 与解码时的其他异常都转成它），由 image_decode_error 归类
+        """
+
+
+def render_reference_boxes(regions: RegionSet) -> str: ...  # the [参考框] body: one JSON line per box
+def render_candidates(regions: RegionSet) -> str: ...       # the [候选区域] JSON body
+def render_material_note(regions: RegionSet) -> str: ...    # the fixed material note (§10.1)
+def project_regions(regions: RegionSet) -> dict: ...        # {"image", "boxes", "items"} (§9.1)
+
+
+OVERLAY_FILL_ALPHA = 64                       # 64/255, about 25.1%
+OVERLAY_OUTLINE_PX = 1                        # same color, opaque, drawn after the fill composite
+OVERLAY_BASE_COLOR = (255, 255, 255)
+OVERLAY_COLORS = (
+    (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48),
+    (145, 30, 180), (0, 170, 170), (240, 50, 230), (128, 128, 0),
+)
+```
+
+Geometry truth is original-image pixels, never rounded. Reference-box bboxes and box-derived vertices
+keep the hook's JSON numeric type. Model-drawn vertices are projected once, always float:
+`x_px = gx * width / 1000`, `y_px = gy * height / 1000`, keeping vertex order. A box-derived rectangle
+has the frozen order `(l,t)→(r,t)→(r,b)→(l,b)→(l,t)` and no holes; rectangles are polygons, and no
+second geometry form exists.
+
+Grid display is exact rational arithmetic (`fractions.Fraction`) and never writes back to the truth.
+The `[参考框]` block and every candidate with non-null `box_id` use outward rounding,
+`gl = floor(l*1000/width)`, `gt = floor(t*1000/height)`, `gr = ceil(r*1000/width)`,
+`gb = ceil(b*1000/height)`, so one box shows identical values in both blocks and keeps positive area.
+Model-drawn vertices use `round(Fraction(x) * 1000 / width)` (half-even) and recover the model's
+original integers. `render_reference_boxes` joins with `\n`, has no trailing newline, and each line is
+exactly `json.dumps({"box_id": box.box_id, "bbox": [gl, gt, gr, gb], "text": box.text},
+ensure_ascii=False)`, so no text can forge another line. `render_candidates` is one line of
+`json.dumps(items, ensure_ascii=False)` with default separators; item key order is `region_id`,
+`polygons`, `box_id`, `source_box_ids`, plus trailing `text` only when `box_id` is non-null; each
+polygon's key order is `exterior`, `holes`; empty candidates render `[]`. This is not GeoJSON.
+
+The overlay renders only candidates, never reference boxes, at the request size. Coordinates map with
+`x_req = min(round(x_px * req_w / width), req_w - 1)` and the matching y form. The chain is: original →
+`Image.Resampling.LANCZOS` to `scaled_size` when over the limit → transparent input composited on
+`OVERLAY_BASE_COLOR` → `convert("RGB")` → `convert("RGBA")` → one shared fill-layer composite → outlines
+→ labels → `convert("RGB")` → PNG. All regions share one RGBA layer composited once, so per-pixel fill
+opacity equals `OVERLAY_FILL_ALPHA` regardless of nesting. Each region's L mask fills each exterior with
+255 and that part's holes with 0, merges parts with `ImageChops.lighter`, covers only the region's
+bounding box plus a one-pixel margin clipped to the canvas, and pastes `(*color, OVERLAY_FILL_ALPHA)` in
+`RegionSet.regions` order; a hole never clears another region's fill. Region i uses
+`OVERLAY_COLORS[i % 8]`. Labels draw the complete `region_id`, centered (`anchor="mm"`) on the mapped
+`label_anchor`, with `ImageFont.load_default(size=font_size)`, `font_size = max(12, round(long_edge *
+0.012))`, `fill=(255, 255, 255)`, `stroke_fill=(0, 0, 0)`, `stroke_width=max(1, font_size // 8)`. A label
+leaving the canvas is shifted whole back inside; one wider or taller than the canvas aligns left or top.
+Shifting never changes geometry or `label_anchor`. Byte determinism is promised only within one Pillow,
+FreeType, Shapely and GEOS build.
 
 ---
 
@@ -772,7 +1003,10 @@ Notes binding on all implementers:
 from __future__ import annotations
 
 import enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from labelkit.common.contracts.types import Usage
 
 
 class LabelKitError(Exception):
@@ -848,16 +1082,30 @@ class SchemaViolation(LabelKitError):
     kind='schema_violation' — or 'callback_violation' when the remaining violations
     all come from the output.validator hook (callback_only=True, spec 3.8.2 L2.5)."""
     def __init__(self, errors: list[str], raw_last_output: str, *,
-                 callback_only: bool = False):
+                 callback_only: bool = False, usage: Usage | None = None):
         self.errors = errors                  # rendered violations: "<json-pointer>: <message>"
         self.raw_last_output = raw_last_output
         self.callback_only = callback_only
+        self.usage = usage                    # v1.22: cumulative usage, written only by
+                                              # _repair_post_validated on repair exhaustion
+                                              # (report.segment_image.usage); None elsewhere
         super().__init__("; ".join(errors))
 
 
 class InternalError(LabelKitError):
     """Invariant breakage (e.g. M11 final validate_only failure). Record-level → 'failed',
     kind='internal_error'; stack goes to stderr log at debug level."""
+
+
+class BoxParserError(InternalError):
+    """v1.22: a segment.box_parser hook defect (§6.4). Record-level → 'failed',
+    kind='internal_error'; no model call and no repair. str() carries only the fixed reason."""
+    def __init__(self, reason: Literal["exception", "return_type", "invalid_json", "invalid_box"],
+                 box_index: int | None, hook: str):
+        self.reason = reason
+        self.box_index = box_index            # 0-based offending box; None when not box-specific
+        self.hook = hook                      # hook reference, never hook data
+        super().__init__(reason)
 
 
 class DeliveryError(LabelKitError):
@@ -894,14 +1142,21 @@ class ErrorKind(str, enum.Enum):
     MISSING_PAIR = "missing_pair"                            # M2, record-level
     INDEX_CONFLICT = "index_conflict"                        # M2, record-level
     IMAGE_TOO_LARGE = "image_too_large"                      # M2, record-level
-    IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
+    IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7/M14 → failed
     SEGMENTATION_INVALID = "segmentation_invalid"            # v1.8: M14, window-level — M8 repair
                                                              # exhausted; "keep" (default) keeps the
                                                              # session alive as ONE whole episode
                                                              # (evidence in _meta.stream.degraded +
                                                              # error event + segment.failures, NEVER
                                                              # in item.errors — S26); "fail" → all
-                                                             # session members failed → rejects
+                                                             # session members failed → rejects.
+                                                             # v1.22 image mode: record-level —
+                                                             # Schema or geometry repair exhausted, or
+                                                             # repair-round overflow → failed → rejects
+    COMPANION_INVALID = "companion_invalid"                  # v1.22: M14 image mode, record-level —
+                                                             # box_parser returned None → failed →
+                                                             # rejects; no model call, no repair,
+                                                             # not bad_input
     CLASSIFICATION_INVALID = "classification_invalid"        # v1.7: M13, M8 repair exhausted —
                                                              # fallback keeps record; "fail" → rejects
     EXTRACTION_INVALID = "extraction_invalid"                # v1.8: M15, transition-level — M8 repair
@@ -1084,6 +1339,9 @@ Binding rules:
   thread's envelope survives (fragments re-sorted in session order; episode_id/thread_id follow
   the surviving envelope, T22). Stitch appends, deletes, reorders and replaces NOTHING; the
   returned value is still the same list object.
+- v1.22: image-mode `SegmentImageStage` uses none of the ②b/②c exceptions. It only writes
+  `item.regions` and may set `failed`, the ordinary behavior of clauses ①④; it never rebinds a Record,
+  appends an envelope or flips a status to `absorbed`, `dropped_noise` or `stitched`.
 - Non-generate stages: return value must be the input list (callers may rely on identity).
 - A stage must catch every per-record exception, append
   `StageError(stage=self.name, kind=..., message=..., retryable=...)` to `item.errors`, set
@@ -1272,7 +1530,8 @@ class QualityConfig:
     rubric: str = ""                              # "default:text"|"default:ui"|
                                                   # "default:trajectory" (v1.8)|"inline";
                                                   # "" = auto by modality (M1 resolves);
-                                                  # v1.8 (S29): "" under segment.enabled = true
+                                                  # v1.8 (S29): "" under
+                                                  # segment.sequence_resolved = true
                                                   # resolves to "default:trajectory" instead
                                                   # (both modalities; an explicit selector always
                                                   # wins; class views inherit via base selector)
@@ -1634,6 +1893,8 @@ class ClassView:                                  # one class's effective config
                                                   # None for flat/process and instruction-only
     business_time_paths: tuple[str, ...] = ()     # complete annotation-Schema instance paths
     time_bindings: tuple[TimeBindingSpec, ...] = ()
+    region_ref_paths: tuple[str, ...] = ()        # v1.22: x-labelkit-region-ref JSON Pointers of this
+                                                  # class's Schema; array items written "*" (§7.7)
 
 
 # ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
@@ -1641,8 +1902,9 @@ class ClassView:                                  # one class's effective config
 @dataclass(frozen=True)
 class StreamConfig:                               # input-side ordering + sessionization
                                                   # declaration, consumed by M2 (§7.1); effective
-                                                  # only under segment.enabled (presence while
-                                                  # disabled → no-op warning, §6.3)
+                                                  # only under segment.sequence_resolved (presence
+                                                  # while segment.enabled = false → no-op warning;
+                                                  # under mode = "image" → rule 76e, §6.3)
     order_by: str = "input_order"                 # "input_order" (text: filename lexicographic →
                                                   # line_no; UI: pair_index ascending) |
                                                   # "meta:<field>" (TEXT MODALITY ONLY; timestamp
@@ -1674,12 +1936,17 @@ class StreamConfig:                               # input-side ordering + sessio
 
 
 @dataclass(frozen=True)
-class SegmentConfig:                              # M14 (§7.14) — the stream-mode master switch
+class SegmentConfig:                              # M14 (§7.14, image mode §7.20). v1.22: enabled
+                                                  # is the stage switch only; stream semantics
+                                                  # key on sequence_resolved. strategy, window,
+                                                  # noise_filter, min_len, context and on_error are
+                                                  # sequence-mode keys (image mode: rule 73a)
     enabled: bool = False                         # false = stage not in chain; output
                                                   # byte-identical to v1.7 except the always-
                                                   # present _meta.stream: null (§9.1). Enabling
-                                                  # requires process mode + generate off +
-                                                  # annotate on (§6.3 rule 29)
+                                                  # requires process mode + generate off, and
+                                                  # annotate on except in image mode with
+                                                  # instruction (§6.3 rule 29)
     strategy: Literal["rules", "llm", "hybrid"] = "hybrid"
                                                   # rules: candidate sessions become episodes
                                                   # as-is, ZERO LLM (noise_filter/min_len
@@ -1688,8 +1955,8 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
                                                   # (rule-layer sessionization is always on in M2;
                                                   # "hybrid" names the rules+LLM composition)
     llm: str = "default"                          # joins the existence/key/probe reference sets
-                                                  # ONLY when strategy ∈ {llm, hybrid} (S30, §6.3
-                                                  # rule 33); UI requests require vision
+                                                  # ONLY when llm_referenced (S30, §6.3 rule 33);
+                                                  # UI requests require vision
     window: int = 20                              # v1.11 (V9) semantics revision: UPPER CAP on
                                                   # frames per window call; M1: >= 2. Budget
                                                   # declared (segment profile context_window > 0):
@@ -1718,20 +1985,37 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
     vision_resolved: bool = False                 # v1.11 (V1) parse PRODUCT — never a user key
                                                   # (the ConsoleConfig.mode_resolved precedent):
                                                   # frozen by M1 at load() end via
-                                                  # dataclasses.replace as
-                                                  # (modality=="ui") ∧ enabled ∧
+                                                  # dataclasses.replace. v1.22, by mode —
+                                                  # sequence: (modality=="ui") ∧ enabled ∧
                                                   # strategy∈{llm,hybrid} ∧
+                                                  # llm_profiles[segment.llm].supports_vision;
+                                                  # image: (modality=="ui") ∧ enabled ∧
+                                                  # instruction non-empty ∧
                                                   # llm_profiles[segment.llm].supports_vision.
                                                   # NOTE: the former user key `use_vision` was
                                                   # REMOVED in v1.11 — an explicit [segment]
                                                   # use_vision key is a DIRECTED CONFIG_ERROR
                                                   # with migration guidance (V2), never the
                                                   # unknown-key forward-compat warning
+    mode: Literal["image", "sequence"] | None = None   # enabled = true 时必填；无默认语义、无别名
+    instruction: str = ""                              # 图片模式分割指令；空串 = 未写
+    box_parser: str | None = None                      # "hooks.py:fn" 引用；None = 不读伴随文件
+    companion_suffix: str | None = None                # 与 box_parser 同时出现，例如 ".xml"
+    resolved_box_parser: ResolvedHook | None = None    # 解析产物，永非用户键
+    sequence_resolved: bool = False                    # 解析产物，永非用户键
+
+    @property
+    def llm_referenced(self) -> bool:
+        """按 enabled 加 mode 判定 segment.llm 是否进入引用集合。
+
+        @return 图片模式写了 instruction，或流模式 strategy 为 llm / hybrid 时为 True；未启用或缺 mode 时为 False。
+        """
 
 
 @dataclass(frozen=True)
 class StitchConfig:                               # v1.9 (spec §5.2 [stitch]): M16 (§7.16)
-    enabled: bool = False                         # true ⇒ segment.enabled (M1 rule 37, T17);
+    enabled: bool = False                         # true ⇒ segment.sequence_resolved (M1 rule 37,
+                                                  # T17);
                                                   # false = stage not in chain, output
                                                   # byte-identical to v1.8 except the dry-run
                                                   # stderr stitch_calls=0 line (m-11, §7.9)
@@ -1776,7 +2060,7 @@ class StitchConfig:                               # v1.9 (spec §5.2 [stitch]): 
 
 @dataclass(frozen=True)
 class ExtractConfig:                              # M15 (§7.15); UI-modality sequences only
-    enabled: bool = False                         # requires segment.enabled AND
+    enabled: bool = False                         # requires segment.sequence_resolved AND
                                                   # run.modality = "ui" (§6.3 rule 30)
     llm: str = "default"                          # when enabled: ALWAYS in all four reference
                                                   # sets AND always in the vision set — every
@@ -1805,7 +2089,7 @@ class FrameClassifyConfig:                        # v1.12: M13 frame-level close
                                                   # Mirrors ClassifyConfig MINUS assignment/
                                                   # max_labels (帧单一归属地基; explicit keys are
                                                   # DIRECTED CONFIG_ERRORs, rule 48)
-    enabled: bool = False                         # true ⇒ segment.enabled = true (rule 43)
+    enabled: bool = False                         # true ⇒ segment.sequence_resolved (rule 43)
     llm: str = "default"                          # joins the reference sets iff enabled;
                                                   # UI requests require vision
     fallback_class: str = ""                      # required iff enabled; must be in the frame
@@ -1827,8 +2111,8 @@ class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-me
                                                   # NO
                                                   # self_consistency (explicit key = DIRECTED
                                                   # CONFIG_ERROR, rule 48)
-    enabled: bool = False                         # true ⇒ segment.enabled outside sequence form
-                                                  # (rule 43)
+    enabled: bool = False                         # true ⇒ segment.sequence_resolved outside
+                                                  # sequence form (rule 43)
     llm: str = "default"                          # UNCONDITIONALLY in the vision set under
                                                   # ui ∧ enabled (screenshots are the primary
                                                   # annotation evidence — sequence-annotate mirror)
@@ -1950,6 +2234,9 @@ class ResolvedConfig:
                                                   # to generic output/sample behavior
     model_user_schema: Mapping = field(default_factory=dict)  # M1 派生的全局标注模型 Schema
     model_frame_schema: Mapping | None = None      # M1 派生并冻结的帧标注模型 Schema
+    region_ref_paths: tuple[str, ...] = ()         # v1.22: x-labelkit-region-ref JSON Pointers of the
+                                                   # global Schema; class views take precedence by the
+                                                   # class_effective_model_schema rule (§7.7)
 ```
 
 The v1.18 public export set of `labelkit.common.config` is exact: `load`, `default_rubric`,
@@ -1969,7 +2256,7 @@ this version and carries no runtime information. This is a conscious, recorded d
 spec 3.1.2's "typed mirror of ALL keys" wording. **[FROZEN HERE, see §12]**
 
 Resolution duties of M1 (beyond merging): resolve `quality.rubric` default by modality
-(`"default:text"` / `"default:ui"`) — v1.8 (S29): when `segment.enabled = true` the empty
+(`"default:text"` / `"default:ui"`) — v1.8 (S29): when `segment.sequence_resolved = true` the empty
 selector resolves to `"default:trajectory"` instead, both modalities, explicit selectors
 untouched; resolve `trace.path` default; resolve `run.input`/`run.output`
 CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; validate and
@@ -2002,6 +2289,11 @@ sequence/frame registries and ClassViews, resolves Schemas/catalog/hooks relativ
 and stores only `ResolvedConfig.sequence_generation`. The program compiler and exact planner run
 after ordinary config assembly but before credential values are materialized. Validate, dry-run
 and run use the same compiler/planner; no runtime RNG is advanced by validation.
+v1.22: `_parse_segment` freezes `sequence_resolved = enabled ∧ mode == "sequence"` while parsing the
+section, because `_check_stream_family` runs before `_freeze_vision`; under `enabled ∧ mode == "image"`
+M1 loads `box_parser` with `load_hook`, checks its signature and freezes `resolved_box_parser`;
+`_postprocessing.py` resolves, freezes and removes `x-labelkit-region-ref` (§7.7). Tests constructing
+a stream config directly set both `mode="sequence"` and `sequence_resolved=True`.
 
 ### 6.2 `labelkit/common/config/loader.py` — API (spec 3.1.3, verbatim)
 
@@ -2034,7 +2326,7 @@ Profile × reference-set × vision navigation table (non-normative consolidation
 | `quality.llm`, `quality.judges[*]` | always when referenced (rule 2) | UI modality: required, including complete stream sequence evidence |
 | `annotate.llm`, `verify.llm` (only when verify enabled), `verify.judges[*]`, `generate.llms[*]`, `output.repair_llm` (when set) | always when referenced (rule 2) | UI modality: required (rule 4); under stream, annotate/verify stay required per the rule-34 table |
 | `classify.llm` | iff `classify.enabled` (rule 23) | UI modality: required; stream requests include every member image |
-| `segment.llm` | iff `segment.enabled ∧ strategy ∈ {llm, hybrid}` (rule 33) | UI modality: required for complete window evidence |
+| `segment.llm` | iff `SegmentConfig.llm_referenced`: image mode with `instruction`, or sequence mode with `strategy ∈ {llm, hybrid}` (rule 33) | UI modality: required for complete window evidence; image mode: required whenever referenced (rule 77b) |
 | `extract.llm` | iff `extract.enabled` — then always all four sets (rule 33) | ALWAYS required (every request carries 2 images, rules 33/34) |
 | `stitch.llm` | iff `stitch.enabled`, no strategy condition (rule 40) | NEVER — pure-text judgment (T16, rule 40) |
 | `frame.classify.llm` | iff `frame.classify.enabled` (rule 43) | UI requests require vision |
@@ -2057,8 +2349,9 @@ Profile references:
 3. **judges 奇数** — `quality.judges` / `verify.judges`: when non-empty, length must be odd.
 4. **UI 模态 vision 要求** — UI modality: every profile used by quality/annotate/verify must
    have `supports_vision = true`.
-   Under segment.enabled, every image-consuming stage profile must have vision support,
+   Under `segment.sequence_resolved`, every image-consuming stage profile must have vision support,
    including segment, frame classification and quality; stitch semantic cards remain text-only.
+   Image mode adds rules 77b and 77c.
 5. **语义去重要求 embedding** — `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set,
    exists in `[embedding.*]`, and that
    profile passes rule 12's declaration check (exactly one of
@@ -2115,7 +2408,9 @@ Rubric:
 
 Stage combination (the four stage-combination constraints of spec 2.3.1):
 17. **标注与打分至少其一** — the first spec 2.3.1 constraint: `annotate.enabled` or
-    `quality.enabled` (at least one) — else CONFIG_ERROR.
+    `quality.enabled` (at least one) — else CONFIG_ERROR. v1.22 (D9): relaxed when
+    `segment.mode = "image"` has `instruction`, because the segment stage is then the producing
+    stage; every other configuration, including image mode with `box_parser` only, is unchanged.
 18. **verify 要求 annotate** — the second spec 2.3.1 constraint: `verify.enabled = true` ⇒
     `annotate.enabled = true`.
 19. **generate 要求文本模态** — the third spec 2.3.1 constraint: `generate.enabled = true` ⇒
@@ -2190,9 +2485,14 @@ apply only when the named switch is on unless stated):
     `generate.enabled =
     false` (generate_only is excluded transitively — rule 10 requires `generate.enabled =
     true` there, so stream × generate_only can never co-validate), and
-    `annotate.enabled = true` (sequence records have no passthrough output form).
+    `annotate.enabled = true` (sequence records have no passthrough output form). v1.22:
+    `segment.enabled` in this rule is the stage switch, and the process-mode and generate-off items
+    apply to both modes with unchanged text. The annotate item applies to `mode = "sequence"`
+    unchanged; it is relaxed for `mode = "image"` with `instruction` (D9); `mode = "image"` without
+    `instruction` and with annotate off reports
+    `{fp}:[segment].enabled: segment.mode = "image" without instruction requires annotate.enabled = true (box_parser-only runs make no model call)`.
 30. **extract 要求 segment 与 UI** — `extract.enabled = true` requires
-    `segment.enabled = true` AND `run.modality = "ui"`
+    `segment.sequence_resolved` AND `run.modality = "ui"`
     (text sequences are out of scope in v1).
 31. **stream 排序与分区键** — `[stream]` fields: `stream.order_by` ∈ {`"input_order"`,
     `"meta:<field>"`};
@@ -2201,11 +2501,13 @@ apply only when the named switch is on unless stated):
     is `"meta:<field>"` (text modality only) or `"source_dir"` (either modality).
 32. **完整证据窗口** — segment.window >= 2. Removed segment.digest_max_chars and
     annotate.sequence_frames are explicit configuration errors. Stream profiles require positive context_window.
-33. **实际引用集合** — segment.llm enters reference sets only for enabled llm/hybrid strategies.
+33. **实际引用集合** — segment.llm enters reference sets iff `SegmentConfig.llm_referenced`:
+    image mode with `instruction`, or sequence mode with an llm/hybrid strategy.
     All actual quality modes after class overrides enter both validation and credential collection.
 34. **视觉证据** — In UI process streams, segment, classify, frame.classify, extract, quality,
     annotate, frame.annotate and verify require vision whenever enabled and consuming member images.
     Stitch semantic cards remain text-only. No image-consuming stage silently drops image evidence.
+    Image mode: with `instruction`, `segment.llm` requires vision; annotate and verify always do.
 35. **按类 extract 白名单** — `[class.<name>.extract]` whitelist: `instruction` ONLY (extends
     rule 25's table; any
     other key → CONFIG_ERROR). `[class.<name>.segment]` does NOT exist as a section:
@@ -2216,12 +2518,12 @@ apply only when the named switch is on unless stated):
     "default:trajectory"
     (v1.8, packaged default_trajectory.toml) | "inline"`; empty-selector resolution per the
     stream default-trajectory ruling (S29):
-    `segment.enabled = true` ⇒ `""` → `"default:trajectory"` (both modalities; explicit
+    `segment.sequence_resolved = true` ⇒ `""` → `"default:trajectory"` (both modalities; explicit
     selectors always win; class views inherit through the base selector). Rules 16/26/27
     apply to the trajectory rubric unchanged.
 
 Stitch (v1.9, spec §5.2 [stitch] rows + spec 2.3.1; T17):
-37. **stitch 要求 segment** — `stitch.enabled = true` requires `segment.enabled = true`
+37. **stitch 要求 segment** — `stitch.enabled = true` requires `segment.sequence_resolved`
     (thread stitching consumes
     segment products only — chain slot segment → stitch → dedup, T5). Transitively this
     inherits rule 29's demands (process mode, generate off, annotate on) and rule 29's
@@ -2279,6 +2581,8 @@ checks apply only when the named switch is on unless stated):
     (`labelkit.common.inference.credentials.referenced_profiles()`) iff their own switch is
     on. Both require vision in UI modality because their complete actual requests carry images.
     M1 freezes the resolved capability after validating the profile.
+    v1.22: `segment.enabled = true` above is the switch-only wording of the unchanged error text; the
+    effective precondition is `segment.sequence_resolved` (error selection after rule 81).
 44. **帧类覆盖要求帧分类或序列生成** — any `[frame.class.<name>]` table present ⇒
     `frame.classify.enabled = true` **∨ `generate.form="sequence"`** (a
     CONFIG_ERROR — deliberately NOT the parked-config warning family, R8); `<name>` must be a
@@ -2328,7 +2632,8 @@ checks apply only when the named switch is on unless stated):
     `generate.form="sequence" ∧ frame.annotate.enabled=true ∧ segment.enabled=false`, `[frame]`
     is live and produces neither rule 43 error nor parked warning. Sequence generation also keeps
     `[frame]` out of the parked list when both frame switches are off because its frame registry is
-    live; `[segment]`, `[stitch]` and `[extract]` continue to warn.
+    live; `[segment]`, `[stitch]` and `[extract]` continue to warn. `segment.enabled = false` in this
+    rule means the switch alone (v1.22).
 
 Sequence generation (current v1.21; every rule in this group is a clean breaking boundary):
 
@@ -2553,6 +2858,76 @@ Sequence generation (current v1.21; every rule in this group is a clean breaking
     validation-hook name, prompt family, report key or wrapper is exported. Unknown-key
     forward compatibility never applies to a deleted owned sequence key; it is rejected with
     `generation_config_invalid` and no migration, alias or fallback.
+
+Image region segmentation (v1.22, SPEC-image-region-segmentation §6; `segment.mode` selects the
+semantics, and it, `run.mode` and `quality.mode` are three unrelated keys). The checks live in
+`labelkit/common/config/_segment_image.py`, entry `check_segment_image(ctx, products)`, called by
+`_check_stream_family` when `segment.enabled = true`; `_LoadCtx` is imported under `TYPE_CHECKING`
+only. Rule 73b applies under `mode = "sequence"`, the others under `mode = "image"`, except that
+rule 77a is issued by `_warn_undeclared_windows`, 77b and 77c by `_check_vision_profiles`, and 81 by
+`_postprocessing.py` during Schema compilation. With `enabled = false` the keys below are parked
+configuration under the existing `_warn_segment_off` warning and `box_parser` is not loaded; the
+`mode` value enumeration is always checked by the parse layer. Whether a key was written explicitly
+is decided by raw-section probes (per-key booleans in `_stream_family_probes`' `segment` table and an
+`input_provided` probe for `input.ui_tree_max_chars`).
+
+Key legality by mode:
+
+| Key | image | sequence |
+|---|---|---|
+| `enabled` | `true` | `true` |
+| `mode` | required | required |
+| `llm` | writable and referenced only with `instruction`; explicit without `instruction` is a directed CONFIG_ERROR | writable; referenced only when `strategy` is `llm` or `hybrid` |
+| `instruction` | optional; non-empty after stripping when written; at least one of it and `box_parser` | directed CONFIG_ERROR |
+| `box_parser` | optional `hooks.py:fn` reference; M1 loads it with `load_hook` and checks its signature statically | directed CONFIG_ERROR |
+| `companion_suffix` | present or absent together with `box_parser`; starts with `.`, contains no path separator, and is case-insensitively none of `.png`, `.jpg`, `.jpeg` | directed CONFIG_ERROR |
+| `strategy`, `window`, `noise_filter`, `min_len`, `context`, `on_error` | explicit is a directed CONFIG_ERROR | existing semantics |
+
+Rules 72–81 are all CONFIG_ERROR, reported once per configuration error, with frozen English text
+(`{fp}` = project path, `{fc}` = config path):
+
+| Rule | Condition | Error text |
+|---|---|---|
+| 72 | `enabled = true` without `mode` | `{fp}:[segment].mode: required when segment.enabled = true; expected "image" or "sequence"` |
+| 73a | image, explicit `strategy` or one of the six keys above | `{fp}:[segment].{key}: not allowed when segment.mode = "image" (sequence segmentation key)` |
+| 73b | sequence, explicit `instruction`, `box_parser` or `companion_suffix` | `{fp}:[segment].{key}: not allowed when segment.mode = "sequence" (image segmentation key)` |
+| 73c | image without `instruction`, explicit `llm` | `{fp}:[segment].llm: not allowed when segment.mode = "image" has no instruction (no segment model call is made)` |
+| 73d | `instruction` empty after stripping | `{fp}:[segment].instruction: must be non-empty when set` |
+| 73e | only one of `box_parser` and `companion_suffix` | `{fp}:[segment].companion_suffix: box_parser and companion_suffix must be set together` |
+| 73f | illegal `companion_suffix` shape | `{fp}:[segment].companion_suffix: expected a suffix starting with "." that is not an image extension, got {value}` |
+| 73g | `box_parser` cannot load | `{fp}:[segment].box_parser: cannot load box_parser {reference!r}` |
+| 73h | illegal `box_parser` signature | `{fp}:[segment].box_parser: box_parser must be synchronous with exactly two positional parameters and no defaults` |
+| 74 | image with neither `instruction` nor `box_parser` | `{fp}:[segment]: segment.mode = "image" requires at least one of instruction and box_parser` |
+| 75 | image with `run.modality != "ui"` | `{fp}:[segment].mode: segment.mode = "image" requires run.modality = "ui", got {modality}` |
+| 76a | image with stitch on | `{fp}:[stitch].enabled: stitch.enabled = true is not available when segment.mode = "image"` |
+| 76b | image with extract on | `{fp}:[extract].enabled: extract.enabled = true is not available when segment.mode = "image"` |
+| 76c | image with frame.classify on | `{fp}:[frame.classify].enabled: frame.classify.enabled = true is not available when segment.mode = "image"` |
+| 76d | image with frame.annotate on | `{fp}:[frame.annotate].enabled: frame.annotate.enabled = true is not available when segment.mode = "image"` |
+| 76e | image with a `[stream]` section | `{fp}:[stream]: the [stream] section is not available when segment.mode = "image"` |
+| 77a | image, a referenced LLM profile's `context_window` not positive | `{fc}:[llm.{name}].context_window: segment.mode = "image" requires a positive deployment context window for every referenced model profile` |
+| 77b | image with `instruction`, `segment.llm` lacks vision | the rule 4 `_check_vision_profiles` text, stage name `segment` |
+| 77c | image, `repair_llm` replays images (`max_repair_attempts > 0`) and lacks vision | the rule 4 text, stage name `output.repair` |
+| 78a | image with `dedup.semantic = true` | `{fp}:[dedup].semantic: not available when segment.mode = "image" (image samples have no text to embed)` |
+| 78b | image with explicit `input.ui_tree_max_chars` | `{fp}:[input].ui_tree_max_chars: not allowed when segment.mode = "image" (image mode builds no UI tree)` |
+| 79 | image with `output.meta_mode = "none"` | `{fp}:[output].meta_mode: must not be "none" when segment.mode = "image" - candidates and original polygons are carried only by _meta.regions (sidecar is legal), got "none"` |
+| 80 | image, `quality.enabled = true`, empty `quality.rubric` (D10) | `{fp}:[quality].rubric: segment.mode = "image" has no default rubric; set quality.rubric or quality.enabled = false` |
+| 81a | non-image project Schema contains `x-labelkit-region-ref` | `{file}:{location}: x-labelkit-region-ref requires segment.mode = "image"` |
+| 81b | annotation inside an `x-labelkit-postprocessor` field or its subtree | `{file}:{location}: x-labelkit-region-ref must not be used inside a x-labelkit-postprocessor field` |
+| 81c | annotation value not `true`, or node `type` not `"string"` or `["string", "null"]` | `{file}:{location}: x-labelkit-region-ref must equal true on a string property or string items` |
+
+Precondition error selection (rules 30, 37, 43, SPEC §7.3): the stitch, extract, frame.classify and
+frame.annotate preconditions mean `segment.sequence_resolved`, and exactly one error is reported.
+`segment.enabled = false` keeps the existing error text byte for byte; `enabled = true` with
+`mode = "image"` reports only rule 76; `enabled = true` without `mode` reports only rule 72. Rule 19 and
+rule 29's process-mode and generate-off items apply to both modes with unchanged text. Generate needs
+no new rule because image mode stays `modality = "ui"`.
+
+Segment-only runs (D9): with `mode = "image"` and `instruction`, annotate and quality may both be off;
+the main output is the §9.1 image-mode record payload plus `_meta.regions`, and dry-run and report drop
+quality items. Without `instruction` this is not relaxed: such a run calls no model and the hook can be
+unit-tested offline. Under D10, image projects cannot omit `[quality]`, because quality defaults on and
+rule 80 rejects its empty rubric.
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
@@ -2560,7 +2935,7 @@ ignored tables, never a CONFIG_ERROR ("keep the config, flip the switch" is lega
 family as the ineffective-top_ratio warning). v1.8 additions (the same parked-tables warning
 family, R8; all
 non-blocking): any of `[stream]`/`[segment]`/`[extract]` present while `segment.enabled =
-false` → ONE warning naming the ignored tables (v1.9: `[stitch]` joins that parked list when
+false` (the switch alone, v1.22) → ONE warning naming the ignored tables (v1.9: `[stitch]` joins that parked list when
 it carries payload beyond its own `enabled` switch while `stitch.enabled = false`);
 `segment.strategy = "rules"` with explicit
 `noise_filter = true` → no-op warning. The effective trajectory rubric without extract warns
@@ -2570,7 +2945,7 @@ v1.9 additions (T17, same family): ① `stitch.enabled = true` with `segment.str
 "rules"` → advisory WARN (rules segmentation has no LLM refinement, so the stitch pool
 receives coarse whole-session cuts — legal but usually unintended; switch strategy to
 `"llm"`/`"hybrid"` to stitch at task granularity); ② `[stitch]` carrying payload beyond its
-own `enabled` switch while `stitch.enabled = false` AND `segment.enabled = true` → its OWN
+own `enabled` switch while `stitch.enabled = false` AND `segment.sequence_resolved = true` → its OWN
 no-op warning (the parked-tables warning lives in the
 segment-OFF branch and cannot fire here; under segment off the table joins that parked list
 instead, see above).
@@ -2580,6 +2955,59 @@ v1.10 addition (spec 3.1.4 console row — independent of the parked-tables fami
 in config.toml with value `"rich"` — the dataclass default "auto" never counts as intent) →
 ONE WARN + forced plain (`mode_resolved = "plain"`), NEVER a CONFIG_ERROR (§7.7 iron rule:
 every stderr line stays `json.loads`-able; the WARN fires on the `validate` path too, U27).
+v1.22 addition: image mode with `instruction` and `output.max_repair_attempts > 2` →
+`{fp}:[output].max_repair_attempts: segment.mode = "image" repairs segmentation at most 2 rounds; larger values do not extend it`
+(L3 rounds are `min(max_repair_attempts, 2)`, §7.7).
+
+### 6.4 User hook surfaces (v1.22)
+
+Every reference uses `"<python-file>:<attribute-path>"` resolved from the project root; M1 loads it
+once and freezes a `ResolvedHook`. There are exactly five hook forms:
+
+| Key | Signature | Return | Program-error semantics |
+|---|---|---|---|
+| `output.validator` | `fn(obj: dict, record: Mapping \| None) -> list[str]` | violation strings; empty passes | §7.7 L2.5 |
+| `generate.sample_validator` | `fn(text: str) -> list[str]` | violation strings | §7.5 |
+| `generate.state_validator` | `fn(value: StateTransitionInput) -> list[str]` | violation strings | §7.7, rule 68 |
+| `annotate.postprocessor`, `frame.annotate.postprocessor` | `fn(candidate: dict, record: Mapping \| None) -> dict` | complete standard JSON object | `PostprocessorError`, §7.7 |
+| `segment.box_parser` | `fn(companion: bytes, image: dict) -> list[dict] \| None` | reference-box array, or `None` to reject the sample | `BoxParserError`, below |
+
+`labelkit/common/extensions/box_parser.py` exports `resolve_box_parser(reference, project_root) ->
+ResolvedHook` and `invoke_box_parser(hook, companion, width, height) -> tuple[ReferenceBox, ...] | None`.
+The frozen callable is `SegmentConfig.resolved_box_parser`; `ValidationHooks` does not carry it. The hook
+must be synchronous with exactly two positional parameters and no defaults. Async functions, async
+`__call__`, generators, async generators, variadics and extra parameters are startup errors (rule 73h).
+M1 checks statically and never calls it. `companion` is raw bytes the hook decodes itself; `image` is
+`{"width": W, "height": H}` in stored pixels.
+
+The unified reference-box format is validated strictly and never corrected:
+
+| Field | Rule |
+|---|---|
+| `id` | Box name (D13). Every box names itself or every box stays unnamed (key absent or `""`); all unnamed are numbered `"1"`, `"2"`…`"N"` in array order; partial naming is `invalid_box`. `null`, non-strings, overlong values or characters outside the set are `invalid_box`. A given name has 1–64 characters from `[A-Za-z0-9_.:-]`, is unique in the sample and does not match `^r[1-9][0-9]*$`. |
+| `bbox` | `[l, t, r, b]`, exactly four, original pixels, integer or finite float (no booleans, NaN or infinity); `0 ≤ l < r ≤ width`, `0 ≤ t < b ≤ height` |
+| `text` | string, may be empty and may contain newlines; must encode as UTF-8 (a lone surrogate is `invalid_box`) |
+
+The framework never clips, rounds, deduplicates or merges. Validation order is frozen: ① exactly `None` →
+`companion_invalid`, neither `None` nor `list` → `return_type`; ② strict JSON copy (tuples, sets, non-string
+keys, NaN, infinity and cycles rejected, the post-processing rule) → `invalid_json`; ③ each item is a
+`dict` whose key set is `{"bbox", "text"}` or `{"id", "bbox", "text"}` → else `invalid_box` with that
+`box_index`; ④ naming consistency against box 0 → first differing box `invalid_box` with its 0-based
+`box_index`; ⑤ per-box values, first violation `invalid_box`; ⑥ number unnamed boxes and build
+`ReferenceBox`. `[]` means valid data with no boxes; `None` means unparseable, and the two never mix.
+
+| Case | Result |
+|---|---|
+| valid `list` | frozen into `RegionSet.boxes` |
+| returns `None` | record `failed`, `stage = "segment"`, `companion_invalid`, fixed reason `box_parser rejected companion`; no model call, no repair, not `bad_input`, `input.on_bad_line` does not apply; counted separately in the report |
+| raises, wrong return type, non-strict JSON, or any box violation | `BoxParserError` → `internal_error`, record `failed`; the log carries only the fixed reason (`exception`, `return_type`, `invalid_json`, `invalid_box`), `box_index` and the hook reference, never data; no model call, no repair |
+| no companion file, `instruction` written | hook not called, boxes empty, the model uses the image |
+| no companion file, no `instruction` (D15) | ingest-time missing pair: counts `missing_pair` and `bad_input`, follows `input.on_missing_pair`, no Record |
+| zero-byte companion file | passed as `b""`; the hook decides |
+
+The hook runs synchronously inside the segment stage before any model task, exactly once per sample. Fan-out
+clones, L3 repair and verify repair never call it again; `validate` and `--dry-run` never call it. It runs
+on the event-loop thread, inside the post-processing trust boundary: no file reads, network or randomness.
 
 ---
 
@@ -2596,13 +3024,16 @@ class IngestPlan:
     files: tuple[str, ...]                         # text: .jsonl files (lexicographic by name);
                                                    # UI: all matched files, tree then image per
                                                    # pair, pairs ascending. Paths relative to
-                                                   # run.input (as RecordRef.source_file)
-    pairs: tuple[tuple[int, str, str], ...]        # UI pairing table (spec 3.2.3 配对表):
+                                                   # run.input (as RecordRef.source_file);
+                                                   # v1.22 image mode: companion (if any) then image
+    pairs: tuple[tuple[int, str | None, str], ...] # UI pairing table (spec 3.2.3 配对表):
                                                    # (index, tree_path, image_path), ascending
-                                                   # by index; text modality: ()
+                                                   # by index; text modality: (); v1.22 image mode:
+                                                   # (index, companion_path | None, image_path)
     estimated_records: int                         # text: total lines (cheap count); UI: len(pairs)
     session_lens: tuple[int, ...] = ()             # v1.8 (S23): session dry-run lengths, filled by
-                                                   # scan(estimate=True) only when segment.enabled
+                                                   # scan(estimate=True) only when
+                                                   # segment.sequence_resolved
                                                    # (single read pass fused with the line count);
                                                    # estimate=False or non-stream: () — feeds the
                                                    # M10 _estimate stream formulas (§7.9)
@@ -2625,6 +3056,9 @@ class IngestReport:
     bad_locations: list[dict] = field(default_factory=list)
                                                    # {"file": str, "line_no": int|None,
                                                    #  "index": int|None, "reason": str}
+    ignored_files: int = 0                         # v1.22 image mode only: files neither images nor
+                                                   # declared companions; outside scanned, bad_input
+                                                   # and the conservation identity
 
 
 @dataclass(frozen=True)                            # v1.8 [FROZEN HERE]
@@ -2711,7 +3145,7 @@ binding, interval or positional evidence. It never consults main output and neve
 fallback. Ordinary JSONL without the v1.20 event envelope keeps existing parsing behavior and
 leaves `exact_dedup_text=None`.
 
-v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `segment.enabled`):
+v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `segment.sequence_resolved`):
 
 - **Ordering.** `stream.order_by = "input_order"` (default): text = filename lexicographic →
   line number; UI = pair_index ascending. `"meta:<field>"` (text only): `<field>` is a dotted
@@ -2728,6 +3162,37 @@ v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `s
   `ingest.disorder` event per record (trace-only; M2 itself logs ONE data-free stderr
   WARN per run — the reason carries timestamp values and never reaches stderr, §8.1);
   `"fail"` = InputError → exit 3.
+
+v1.22 image-mode discovery (SPEC-image-region-segmentation §8; only when `segment.enabled ∧ mode ==
+"image"`, where `Ingestor` delegates to `labelkit/operators/ingest_image.py`). Non-image pairing and
+counts stay byte-identical, including `examples/ui` at `scanned=6 ingested=5 bad_input=1`:
+
+- **Images** keep `_IMAGE_RE` (`image_<n>.(png|jpg|jpeg)`, extension case-insensitive) and the global
+  index namespace: recursive scan, base-10 index, shared across subdirectories. Two or more images for
+  one index, including png plus jpg or same names across subdirectories, are `index_conflict` under
+  `input.on_index_conflict`, so `source.pair_index` is unique. Arbitrary filenames are not discovered.
+- **Companion files** take part only when `box_parser` is registered: the name is `image_<n>` plus
+  `companion_suffix` (case-sensitive), paired by index across subdirectories. Two or more for one index
+  are `index_conflict`. A companion without an image is a missing pair (`present = "companion"`) under
+  `input.on_missing_pair`.
+- **An image without a companion** is legal with `instruction`. Without `instruction` (D15) it is a
+  missing pair (`present = "image"`): counts `missing_pair` and `bad_input`, no Record, never an empty
+  candidate set. Image mode parses no tree; `uitree_<n>.jsonl` has no special meaning there.
+- **Plan.** `pairs` are `(index, companion_path | None, image_path)`; `files` list the companion (if any)
+  then the image, the id concatenation order; `session_lens` is always `()`.
+- **Bytes and digests.** The companion is read as raw bytes into `Record.companion`, its path into
+  `Record.companion_path`; M2 computes `image_sha256` and `companion_sha256` while holding the bytes.
+  There is no new companion size limit; `input.max_image_mb` constrains only images.
+- **Ignored files.** A file that is neither an image nor a declared companion counts in
+  `IngestReport.ignored_files` (without a hook, every non-image file). A positive count logs exactly one
+  count-only WARN, `image mode: ignored %d file(s) that are neither images nor declared companion files`.
+  The count enters neither `scanned` nor `bad_input` nor the conservation identity.
+- **Header check** is owned by ingest: `_check_image` (magic number, `input.max_image_mb`), then a Pillow
+  lazy `open` reading only the header, never `load()` or `verify()`. The format must be recognized and
+  `width × height` must not exceed `Image.MAX_IMAGE_PIXELS`; `DecompressionBombError` and
+  `DecompressionBombWarning` (raised to an error by `warnings.catch_warnings`) both mean over the limit.
+  Orientation is not checked (D4). Failure takes the bad-sample path: counts `bad_input`, English error
+  log, no Record. With the segment switch off, image-only directories remain unable to ingest (D5).
 
 ### 7.2 M3 — `labelkit/operators/dedup.py`
 
@@ -2776,7 +3241,10 @@ production `MinHashLSH` with the same threshold/permutation pair so `validate` c
 combination that `run` cannot initialize. Image layer (UI): 64-bit
 pHash, Hamming ≤ `image_phash_max_distance`; matched by linear scan over all kept hashes — a
 recorded deviation from spec 3.3.3's 16-bit-prefix bucketing (see §12 #24, the pHash
-linear-scan ruling). UI composite verdict via
+linear-scan ruling). An integer-mode image (`I`, `I;16`, `I;16L`, `I;16B`) whose maximum exceeds
+255 is scaled linearly to 8-bit by that image's own maximum before the imagehash default DCT, whose
+`convert("L")` would otherwise clip every such value to white; all other images hash unchanged.
+UI composite verdict via
 `ui_dup_requires` ("both": tree-hit AND image-hit; an exact-layer hit always wins
 unconditionally). Semantic layer: after the exact/approximate/image layers, only for records
 not yet judged duplicates (with "both", a lone image-layer hit does
@@ -2822,6 +3290,20 @@ ordered_exact_dedup_texts]))`; a single uses the same formula with a one-element
 already removed every declared business-time path, so a valid rebound replay remains an exact
 duplicate while any non-time payload difference cannot match. Ordinary records with null carrier
 retain the existing four-level behavior.
+
+v1.22 image mode (SPEC-image-region-segmentation §15.1):
+
+- **Exact layer.** The key is the canonical JSON `["labelkit:image", "exact", <image_sha256>,
+  <companion_sha256 or null>]` via `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`.
+  `Record.exact_dedup_text` stays null, so the pHash layer still runs.
+- **Near-duplicate tree side.** Reference boxes replace the tree: `item.regions.boxes` builds canonical
+  text with one `[l,t,r,b] text` line per box, coordinates always int (`floor(c / q)` when `q > 0`,
+  `floor(c)` when `q = 0`, `q = dedup.bounds_quantize_px`), `text` as `json.dumps(box.text,
+  ensure_ascii=False)`, no id, in hook return order, joined by `\n`, fed to MinHash.
+- **Composite verdict.** `ui_dup_requires` applies as usual. A sample without reference boxes has no tree
+  side: `"both"` degrades to `"image"` for that record, and `"tree"` can then only be an exact duplicate.
+- **Semantic layer ④** does not apply: rule 78a rejects it, and embedding profiles stay out of the
+  reference, credential and probe sets.
 
 ### 7.3 M4 — `labelkit/operators/quality.py`
 
@@ -2928,6 +3410,7 @@ class AnnotatePromptOptions:
     transitions: tuple[Transition, ...] | None = None
     image_px: int | None = None
     temporal_context: SequenceTemporalContext | None = None
+    regions: RegionSet | None = None        # v1.22 image mode: selects the §10.1 image variant
 
 def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           opts: AnnotatePromptOptions = AnnotatePromptOptions()) -> PromptBundle: ...
@@ -3000,6 +3483,58 @@ future annotation/transition/postprocessor contents are checked again when actua
 asset overflow changes sequence/pairwise units to fixed; frame and transition keep their existing minimum
 unit so a frame annotation failure cannot accidentally fail an entire sequence.
 
+v1.22 image mode (SPEC-image-region-segmentation §12–§13). The prompt branch is
+`AnnotatePromptOptions.regions is not None` (§10.1); annotate fills it from the envelope, and
+self-consistency samples and L3 repair share the same frozen object. Both images bill through
+`n_images × image_cost` with no formula change, and the `_PackScale` single-image invariant comment is
+revised. Candidate and reference-box blocks are fixed and never trimmed, so overflow raises
+`ContextOverflowError(phase="precheck")`; candidates, the original and the overlay are never silently
+dropped. Repair-round overflow keeps the existing attribution (D11): M8 short-circuits to
+`SchemaViolation`, the breaker is fed exactly once, and the record fails `schema_violation`. Voting still
+covers only top-level enum, boolean and integer fields, so `items[].region_id` does not vote and
+`agreement_ratio` says nothing about region selection. `annotate.py:1026-1028` is the stream-member path,
+unreachable here, and keeps its tree access.
+
+`labelkit/operators/annotation_finalization.py` gains one parameter on each helper (`annotation_transforms`
+is exactly at the five-parameter limit; frame paths pass `None`):
+
+```python
+def annotation_record_context(record: Record, regions: RegionSet | None) -> Mapping | None: ...
+def annotation_transforms(record: Record, cfg: ResolvedConfig, label: str | None,
+                          temporal_context: SequenceTemporalContext | None,
+                          regions: RegionSet | None) -> tuple[AnnotationFinalizer, AnnotationProjector]: ...
+```
+
+With non-null `regions`, the context is framework-bound JSON, supplied to both the postprocessor and
+`output.validator` from the result of one call and deep-copied fresh for each. It is not a raw row, so it
+does not fabricate raw fields; text, member-frame and sequence contexts keep their values and
+`passthrough_fields` still reads `Record.raw`. The hook signature is unchanged. Key order is frozen:
+
+```json
+{
+  "sample_id": "8f3c2a91d0b47e65",
+  "source": {"file": "image_7.png", "pair_index": 7},
+  "image": {"width": 1080, "height": 2340},
+  "boxes": [
+    {"id": "n12", "bbox": [43, 140, 821, 1264], "text": "Button 登录"}
+  ],
+  "regions": [
+    {"region_id": "n12",
+     "geometry": {"type": "Polygon",
+                  "coordinates": [[[43, 140], [821, 140], [821, 1264], [43, 1264], [43, 140]]]},
+     "box_id": "n12",
+     "source_box_ids": ["n12"]}
+  ]
+}
+```
+
+`sample_id` is the record id; `source.file` is relative to `run.input`; `boxes` is the `RegionSet.boxes`
+JSON projection with exactly `{"id", "bbox", "text"}` and a non-empty string `id`; `regions[]` equals
+`_meta.regions.items[]` element by element, both from `project_regions`. The context carries path strings
+only, no file handle or pixels. Startup probes and few-shot dry runs still call `output.validator` with
+`None`, so image-mode validators and hooks must handle `record is None`; few-shot `region_id` values get
+only Schema checks, no reference check.
+
 v1.12 frame pass (SPEC-frame-annotation §3.3; extended by the current process-session capacity contract):
 
 The frame pass runs after successful sequence annotation, or directly on the separately legal generation
@@ -3070,14 +3605,15 @@ class VerifyStage(Stage):
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
 ```
 
-Normative behavior (3.7): per active item with an annotation, judge prompt per §10.3, output
+Normative behavior (3.7): per active item with an annotation, judge prompt per §10.5, output
 validated against `VERDICT_SCHEMA` (§10.7). Multi-judge: independent identical prompts, verdict
 by majority, all critiques merged with `"judge"` field added, one `verify.verdict` trace event
 per judge per round. Policy drop: fail → `status="dropped_verify"`. Policy repair: on fail and
 rounds used < `max_repair_rounds`: build `RepairContext(previous_output=item.annotation.output,
 critiques_text=<all prior rounds of critiques from judges that voted fail, in round/panel order, "aspect: opinion",
 multi-judge prefixed with judge name>)`, call
-`annotate_record(record, ctx, AnnotatePromptOptions(repair=repair))`; new
+`annotate_record_leaf(record, ctx, AnnotatePromptOptions(repair=repair, label=…,
+temporal_context=…, regions=item.regions))`; new
 annotation replaces `item.annotation`; re-verify; still fail at budget → drop as above.
 `VerificationResult.rounds` counts review rounds incl. the first; `critiques` accumulate over
 rounds in order. Verify errors on a record (provider exhausted etc.) → `failed` per stage
@@ -3097,18 +3633,20 @@ class VerifyPromptOptions:
     fit: _PromptFit | None = None                       # ordinary record budget state only
     member_positions: tuple[int, ...] = ()              # process sequence occurrence positions
     boundary_records: tuple[tuple[int, Record], ...] = ()  # allowed complete neighbors with occurrence positions
+    verdict_form: bool = False                          # generation sequence verdict-form variant
+    regions: RegionSet | None = None                    # v1.22 image mode: selects the §10.5 image variant
 ```
 
 The default instance is the pre-v1.7 single-record classic call. The builder is NOT part of the
 frozen public surface, but the option object's field names and semantics are frozen here so the
-stage driver and the docs agree; `_repair_ladder` steps a variant with
-`dataclasses.replace(opts, image_px=…)` on ordinary single-record ANNOTATE options (§7.4), never by
-positional re-assembly.
+stage driver and the docs agree. Classic repair issues one `annotate_record_leaf` call per round from
+`_reannotate_leaf`; no separate repair-ladder helper exists and verify does not step `image_px`. Option
+variants use `dataclasses.replace`, never positional re-assembly.
 
 v1.7 label threading (R3): `options.label` selects the class-effective values for both the
 `[任务指令]` section and `extra_criteria` (`class_views[label].annotate.instruction` /
 `class_views[label].verify.extra_criteria`); `_judge_round`/`_reannotate` thread the label
-through, and repair re-annotation calls `annotate_record(record, ctx, AnnotatePromptOptions(…,
+through, and repair re-annotation calls `annotate_record_leaf(record, ctx, AnnotatePromptOptions(…,
 label=…))` (§7.4). The stage passes `item.classification.label if item.classification else None`;
 `verify.verdict` payloads gain `label` (classify enabled only, §8.1).
 
@@ -3162,7 +3700,7 @@ retained; the classic repair loop now accumulates fail-voter critiques across ro
   ④ synchronous record rebuild (`dataclasses.replace(record, members=...)`; the record
   **id is NOT recomputed**) and transitions rebuild (renumbered so
   `len(transitions) == len(members) − 1` holds); ⑤ concurrent re-annotation via
-  `annotate_record(record, ctx, AnnotatePromptOptions(transitions=<rebuilt>,
+  `annotate_record_leaf(record, ctx, AnnotatePromptOptions(transitions=<rebuilt>,
   …))`; → next-round
   re-review. Repair
   rounds count against `max_repair_rounds` INCLUDING the first review.
@@ -3195,6 +3733,29 @@ retained; the classic repair loop now accumulates fail-voter critiques across ro
   `verify.boundary_flags` (mark-only boundary determinations), `verify.defects.<kind>`
   (per defect kind — six kinds incl. `wrong_stitch`, v1.9) → `report.stream.verify`.
   Defect summaries ride the `verify.verdict` event payload (content-tiered, §8.1).
+
+v1.22 image mode (SPEC-image-region-segmentation §14). `_plan_classic_review` fills
+`VerifyPromptOptions.regions` from `state.item.regions`, selecting the §10.5 image variant; `_panel_fit`
+then bills two images and treats the candidate block as fixed. `_reannotate_leaf` passes `item.regions`
+into `AnnotatePromptOptions`, the same object, and verify never calls segment. `verify.py:923` keys on
+`segment.sequence_resolved`; image samples are `kind = "single"` and never reach the stream driver. With
+`verify.judges`, a judge's reactive overflow or its own repair overflow keeps the current meaning (D11):
+`_judge_error_entry` records one `judge_error` dissenting vote, and only the stage-level precheck fails
+with `context_overflow`. `_excerpt_source` returns `""` when `record.ui_tree is None`. Review sees geometry
+twice, as grid values in `[候选区域]` and as pixel floats in code-owned `[标注结果]` fields; neither is
+trimmed, so verify may overflow after annotate succeeded. This revision offers no deduplication.
+
+Record-level error attribution including image mode:
+
+| Kind | Stage | Outcome |
+|---|---|---|
+| `image_decode_error` | M3 | pHash skipped, record stays active |
+| `image_decode_error` | M5, M7, M14 | `failed`, including `DecompressionBombError` and an image changed after ingest |
+| `companion_invalid` | M14 image mode | `failed`; `box_parser` returned `None` |
+| `segmentation_invalid` | M14 image mode | `failed`; Schema or geometry repair exhausted, or repair-round overflow (D11) |
+| `segmentation_invalid` | M14 sequence mode | window-level; `segment.on_error` semantics unchanged (§4) |
+| `schema_violation` | M5 | `failed`; repair exhausted, or repair-round overflow (D11) |
+| `context_overflow` | every LLM stage | first-round precheck or reactive overflow (§9.2) |
 
 v1.18 sequence attempts invoke VerifyStage through the `run_attempt` protocol in §7.18.
 They reuse the existing sequence-record verify core and class-effective criteria, but fatal
@@ -3231,17 +3792,8 @@ class CallScope:
     repair_context_bytes: int | None = None
     complete_evidence: bool = False
     retain_repair_prompt: bool = False
-
-
-@dataclass(frozen=True)
-class PostValidationResult:
-    """对一个候选恰好执行一次可执行后置验证的结果。"""
-
-    violations: tuple[str, ...]
-    event_execution: EventExecution | None
-
-
-CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
+    region_ids: frozenset[str] | None = None      # v1.22: known region ids; None disables the check
+    region_ref_paths: tuple[str, ...] = ()        # v1.22: x-labelkit-region-ref paths to check
 
 
 @dataclass(frozen=True)
@@ -3257,27 +3809,39 @@ class FinalizedCallRequest:
     repair_projector: Callable[[Mapping[str, object]], Mapping[str, object]]
 
 
+# labelkit/common/contracts/post_validation.py (v1.22, neutral; no runtime llm_client/schema_engine import)
+@dataclass(frozen=True)
+class PostValidationResult:
+    """M8 单次后置校验产生的违规或成功证明。"""
+
+    violations: tuple[str, ...]                   # 可修复违规；成功时为空
+    proof: object | None                          # 成功时非空的证明对象
+
+
+CallPostValidator: TypeAlias = Callable[[Mapping[str, object]], PostValidationResult]
+
+
 @dataclass(frozen=True)
 class PostValidatedCallRequest:
-    """一次要求在 L2 后执行可执行后置验证的内部调用。"""
+    """一次带 request-local 后置校验器的 M8 调用。"""
 
-    profile: str
-    prompt: PromptBundle
-    schema: Mapping[str, object]
-    scope: CallScope
-    post_validator: CallPostValidator
+    profile: str                                  # 调用 profile
+    prompt: PromptBundle                          # 完整提示包
+    schema: Mapping[str, object]                  # 完整内部 Schema（构造时深冻结）
+    scope: CallScope                              # 记账与 trace 范围
+    post_validator: CallPostValidator             # 仅本请求生效的后置验证器
 
 
 @dataclass(frozen=True)
-class ValidatedGenerationCall:
-    """已验证对象及为该同一对象产生的执行证明。"""
+class ValidatedPostCall:
+    """M8 后置验证成功且保留同一证明对象的结果。"""
 
-    object: Mapping[str, object]
-    event_execution: EventExecution
-    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]
-    usage: Usage
-    attempts: int
-    model: str
+    object: Mapping[str, object]                  # 成功候选对象
+    proof: object                                 # 同一候选的成功证明
+    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]  # 内部解析路径
+    usage: Usage                                  # 累计 token 用量
+    attempts: int                                 # 总 LLM 调用次数
+    model: str                                    # 首轮实际模型名
 
 
 class SchemaEngine:
@@ -3303,11 +3867,11 @@ class SchemaEngine:
     async def complete_post_validated(
         self,
         request: PostValidatedCallRequest,
-    ) -> ValidatedGenerationCall:
-        """对每个 L2 候选恰验证一次并返回匹配的执行证明。
+    ) -> ValidatedPostCall:
+        """对每个 L2 候选恰验证一次并返回匹配的成功证明。
 
         @param request 含 request-local 后置验证器的完整调用请求。
-        @return 已验证对象及该同一候选的执行证明。
+        @return 已验证对象及该同一候选的成功证明。
         """
 
     async def complete_finalized(
@@ -3321,18 +3885,31 @@ class SchemaEngine:
         """
 ```
 
-For every first response or L3 candidate that passes L2, `complete_post_validated` calls the
+`complete_post_validated` is the single generic post-validation seam (v1.22) and carries no
+geometry or event semantics. For every first response or L3 candidate that passes L2, it calls the
 request's validator exactly once. Non-empty string violations with
-`event_execution is None` enter the same bounded L3 list with `(post-validator)` prefixes.
-Empty violations plus a non-null EventExecution are the only success shape. Any other shape,
+`proof is None` enter the same bounded L3 list with `(post-validator) ` prefixes.
+Empty violations plus a non-null `proof` are the only success shape, and the same proof instance is
+returned, never copied. Any other shape,
 non-string violation or non-`PostValidationResult` return is `post_validator_invalid`;
 callback exceptions are `post_validator_exception`. Those two terminal candidate errors do
-not enter L3 and never include exception text or user content. EventPlan L3 replays the original
-prompt-safe request messages, appends the previous candidate as an assistant message, then
-appends one user repair message containing only controlled violations. It never adds state beyond
-the ActorView/visible state already present in the original prompt, nor does it add EventExecution
-or hook exceptions. The accepted EventExecution is returned and the caller must not execute the
-patch or state hook again.
+not enter L3 and never include exception text or user content. L3 always replays the original
+request messages through `_build_post_repair_prompt`, including images and `image_px`, without reading
+`retain_repair_prompt`, appends the previous candidate as an assistant message, then
+appends one user repair message containing only controlled violations (§10.6.1). Rounds are
+`min(max_repair_attempts, 2)`. Repair-round overflow returns no response and ends in `SchemaViolation`,
+fed to the breaker once; on repair exhaustion `_repair_post_validated` writes cumulative
+`SchemaViolation.usage`. `CallScope.repair_context_bytes` is null for segment image calls.
+
+Callers own proof typing. EventPlan's proof is `EventExecution`, and `scenario.py` raises `InternalError`
+if `result.proof` is anything else. Its repair never adds state beyond the ActorView/visible state already
+present in the original prompt, nor EventExecution or hook exceptions, and the caller must not execute the
+patch or state hook again. Image-mode segment's proof is `RegionSet` (§7.20). The carriers moved to
+`labelkit/common/contracts/post_validation.py`, a neutral module that freezes `schema` and `object` deeply
+in `__post_init__` with its private `_freeze_json` and leaves `proof` uncopied; `PostValidationResult.violations`
+passes through the same function, so a list becomes a tuple and a non-container shape stays invalid. `ValidatedGenerationCall`
+is renamed `ValidatedPostCall` and its field `event_execution` is renamed `proof`, with no alias or
+re-export; `generation.py`'s two injection lines into `schema_engine` are deleted.
 
 The configured state validator follows that same closed classification: a runtime invalid
 `list[str]` return becomes `post_validator_invalid`, an exception becomes
@@ -3359,9 +3936,10 @@ and skip this second outcome check. StateEvaluator still replays and verifies th
 independently.
 
 Post-validators are request-local and are never stored on SchemaEngine. Scenario seed, frame
-render, semantic evaluation and noise use `complete_validated`; only event planning uses
-`complete_post_validated`. Existing `output.validator` L2.5 semantics do not apply to these
-internal generation Schemas. `ValidatedGenerationCall.resolved_at` records the successful
+render, semantic evaluation and noise use `complete_validated`; within generation only event planning uses
+`complete_post_validated`, and outside generation only image-mode segment uses it. Existing
+`output.validator` L2.5 semantics do not apply to these
+internal Schemas. `ValidatedPostCall.resolved_at` records the successful
 candidate's exact internal path and never increments the global user-Schema
 `report.schema_engine.resolved_at` ledger.
 
@@ -3382,11 +3960,27 @@ preserves cumulative usage, attempts, first-response model, resolved-at and trac
 verify 评审完整结果；记录修复、episode repair、frame backfill 与 L3 的每个新候选均经过同一边界。
 自洽采样按模型 Schema 选择已经完整验证的原候选；不拼接新对象，也不再次执行后处理。
 
-后处理接收候选和原始记录的深拷贝，普通记录与帧使用真实 `Record.raw`，序列记录使用 `None`。
+后处理接收候选和原始记录的深拷贝，普通记录与帧使用真实 `Record.raw`，序列记录使用 `None`，
+图片模式样本使用框架绑定的样本上下文（v1.22，§7.4）。
 函数同步接受两个位置参数并返回完整标准 JSON 字典；返回后再次深拷贝。模型 Schema 通过前零调用，
-每个合格候选恰一次调用。用户 validator 在运行和启动 few-shot 校验时也接收候选及 raw 的深拷贝，
+每个合格候选恰一次调用。用户 validator 在运行和启动 few-shot 校验时也接收候选及 raw（图片模式运行时为同一样本上下文）的深拷贝，
 其参数变异不得写回正式候选。程序错误不能进入 L3；sequence 内部错误原样终态传播、退出 4，
 不消耗 slot attempt，并保留已有成功交付工件。普通批处理仍只失败当前记录。
+
+v1.22 region references (D6). `x-labelkit-region-ref: true` may mark a string property or string `items`
+in an annotation Schema (rule 81). M1 freezes marked paths into `ClassView.region_ref_paths` and
+`ResolvedConfig.region_ref_paths` by the `class_effective_model_schema` selection rule, as JSON Pointers
+whose array items are `*` (for example `/items/*/region_id`), and removes the marker from the
+provider-facing model Schema and the L2 Schema; the complete Schema keeps it. `CallScope.region_ids` comes
+from the same `RegionSet`, never parsed back from user-visible JSON; null disables the check. The check runs
+in `complete_finalized` after model-Schema L2 and before the finalizer, and in `complete_validated` (no
+postprocessor) after L2 and before L2.5. Null values and absent optional fields are skipped. An unknown value
+is the repairable violation `<concrete-pointer>: unknown region reference`, for example
+`/items/0/region_id: unknown region reference`, which never echoes the model's value, enters L3, and makes
+the sample abstain under self-consistency. Duplicate references and full-selection rules are business logic
+for the user's validator or hook. A postprocessor exception stays a program error and is not a reference
+check. Schema-level range, integer and vertex-count violations of `segment_image_schema()` are decided at L2
+and rendered by the unchanged `_render_error` in the §10.6 expected-versus-actual wording.
 
 The v1.18 internal builders are exact and their JSON is frozen in §10.7:
 
@@ -3408,7 +4002,8 @@ def noise_semantic_evaluation_schema() -> dict: ...
 Frame render and noise render pass the selected user-authored object frame Schema directly.
 The event planner Schema allows only `test|add|remove|replace`; executable ordering,
 permissions, Schema and hook checks belong to the post-validator. The schema engine does not
-define or recognize any deleted sequence-specific schema name.
+define or recognize any deleted sequence-specific schema name. v1.22 adds
+`def segment_image_schema() -> dict: ...` beside these builders (§10.7).
 ### 7.8 M9 — `labelkit/common/inference/llm_client.py`
 
 Dataclass-mirror language note (2026-08-14): the shapes below stay frozen field for field, but the
@@ -3422,7 +4017,7 @@ text. The same reading applies to every other dataclass block in this document.
 class Part:
     kind: Literal["text", "image"]
     text: str | None = None
-    image: ImageRef | None = None
+    image: ImageRef | RegionOverlayRef | None = None   # v1.22: RegionOverlayRef (§3.1)
 
 
 @dataclass(frozen=True)
@@ -3758,6 +4353,13 @@ missing-usage gateway fallback [C-64]). Image encoding: the effective long-edge 
 signature is unchanged; the
 builder passes the effective value in).
 
+v1.22 image parts: `Part.image` accepts `RegionOverlayRef` (§3.1), whose `load_base64` has the `ImageRef`
+call shape, always returns `image/png` and retains no bytes. Rendering runs per HTTP attempt on the
+event-loop thread. Images are placed only in user messages, because the Anthropic builder discards images
+in system messages. The trace `full` tier records an overlay as
+`{"type": "image", "path": <original path>, "overlay": "regions"}`, never inlined bytes; ordinary images keep
+their form.
+
 ### 7.9 M10 — `labelkit/orchestration/process_workflow.py`
 
 ```python
@@ -3812,7 +4414,7 @@ stage in chain order — the SINGLE SUPERSET TUPLE (v1.9)
 segment and dedup, T5]** — with segment/stitch/extract DEFAULT
 OFF, so the effective v1.7 chain dedup → classify → quality → generate → annotate → verify is
 a byte-identical degradation (`generate` and `segment` are mutually exclusive per §6.3 rule
-29 and stitch requires segment per rule 37, so generate never co-occupies the chain with any
+29 and stitch requires `segment.sequence_resolved` per rule 37, so generate never co-occupies the chain with any
 stream stage; `_compose_chain`'s enabled map carries the matching `"stitch":
 cfg.stitch.enabled` entry — inserting the tuple name alone is necessary but not sufficient;
 it includes classify in the main,
@@ -3860,7 +4462,7 @@ v1.7 classify orchestration (spec 3.10.3 分类与扇出 row):
   `[class.*]` overrides exist or assignment is "multi", stderr notes "estimated on the global
   config / multi reported as a lower bound (label multiplier 1)".
 
-v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.enabled`):
+v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.sequence_resolved`):
 
 - **Complete-session processing.** M10 consumes ingestor.sessions() and processes each complete
   session in order. batch_no is the session ordinal; run.batch_size limits task leaves per physical
@@ -3880,7 +4482,7 @@ v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.en
   absorbed − dropped_noise − stitched, 0)` — without the new terms, absorbed members (or
   v1.9 shells, which are terminal, not failed) would be
   miscounted as failed. `batch.end` payload gains `episodes`/`absorbed`/`dropped_noise`
-  (carried only when segment is enabled, R20 form, §8.1); the stderr progress/summary line
+  (carried only when `segment.sequence_resolved`, R20 form, §8.1); the stderr progress/summary line
   gains NO new keys (fan-out precedent — the report carries them).
 - **Conservation & interrupted residual (S18).** The full expanded invariant is §9.3's
   `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
@@ -4005,6 +4607,20 @@ v1.19 Application and sequence-delivery orchestration:
 - **Report assembly.** SequenceWorkflow supplies the frozen sequence report node and usage
   accumulated across every attempt. ProcessWorkflow does not infer counters from terminal
   PipelineItems and does not add old stream/quota/tier/brief/realize/shortfall keys.
+
+v1.22 orchestration (SPEC-image-region-segmentation §7, §16). Session routing, the session estimate base,
+`report.stream`, episode/absorbed/noise counts, `minimum_frames`, the widened `unprocessed` condition, the
+`batch.end` stream keys and the stream dry-run notes all key on `segment.sequence_resolved`. `_compose_chain`
+keeps `cfg.segment.enabled`, so an image-mode segment stays in the chain and on the console chain list. Image
+samples take the ordinary batch path with `session_attempt = None`.
+
+- **Estimate.** `segment_calls = estimated_records` with `instruction` (repair rounds excluded), else 0. There
+  is no session rehearsal and `IngestPlan.session_lens` is empty. Goldens:
+  `tests/cli/goldens/dryrun-image-model.txt` and `tests/cli/goldens/dryrun-image-boxes.txt`.
+- **Presentation.** The console shows no `/stream` badge; `_log_budget_startup` prints no `minimum_frames` line.
+- **Report.** `report.segment_image` and `counts.ignored_files` appear only in image mode (§9.3). A
+  segment-only run (D9) drops quality items from dry-run and report.
+
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
 ```python
@@ -4085,8 +4701,8 @@ v1.8 (spec 3.11.2 stream rows):
   `("segment", "noise")` | `("segment", "below_min_len")` | `("verify", "off_task_member")`
   (§9.2 — these frames carry no `item.errors` entry, so the `errors[0]` rule cannot serve
   them).
-- **`_assemble_meta`** gains the ALWAYS-PRESENT `stream` key (`null` whenever segment is
-  disabled), positioned after `source` and before `scores` (chain-order mirror, §9.1); in
+- **`_assemble_meta`** gains the ALWAYS-PRESENT `stream` key (`null` unless
+  `segment.sequence_resolved`), positioned after `source` and before `scores` (chain-order mirror, §9.1); in
   stream mode `_meta.verification` additionally carries the always-present `defects` key
   (`[]` when none — §9.1); non-stream verification blocks do NOT carry the key.
 - **`_raw_payload`** (rejects `full` tier) gains a `kind == "sequence"` branch emitting
@@ -4106,6 +4722,15 @@ off-mode byte-equivalence condition, m-11):
   threads' frames; downstream slicing must use `fragments[].order_span` (§9.1).
 - Stitched shells and rescue-flipped frames never produce output lines (fourth/third route);
   `--strict` semantics note in §9.2.
+
+v1.22 image mode (SPEC-image-region-segmentation §16.1–§16.2):
+
+- **`_assemble_meta`** adds the conditional top-level `regions` key after `stream` and before `scores` (§9.1),
+  from `project_regions`. Its docstring records this exception to "all keys always present". Non-image lines
+  do not carry the key.
+- **`_raw_payload`** gains an image-mode branch for annotate-off main output and the rejects `full` tier:
+  `{"image_path": str}`, plus `"companion_path": str` when a companion exists; no `ui_tree` key and no
+  inlined companion bytes. Non-image UI records keep `{ui_tree, image_path}` byte for byte.
 
 v1.18 sequence delivery adds a separate delayed emitter and leaves the ordinary Emitter
 contract above unchanged:
@@ -4367,7 +4992,8 @@ and (v1.6) `EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"`, `EV_LLM_KEY_DISABLED = "l
 `EV_INGEST_DISORDER = "ingest.disorder"`, `EV_SEGMENT_SESSION = "segment.session"`,
 `EV_SEGMENT_BOUNDARY = "segment.boundary"`, `EV_EXTRACT_STEP = "extract.step"`, and (v1.9)
 `EV_STITCH_JUDGE = "stitch.judge"`, `EV_STITCH_THREAD = "stitch.thread"` (T16 — the
-EV_SEGMENT_BOUNDARY mirror pair; both trace-only, §8.1).
+EV_SEGMENT_BOUNDARY mirror pair; both trace-only, §8.1), and (v1.22)
+`EV_SEGMENT_REGIONS = "segment.regions"` (trace-only, §8.1).
 
 v1.8 redaction constants (S27, §8.3): `_FREE_TEXT_KEYS` gains `"description"` (LLM-produced
 free text — stripped at `none`, carried from `refs`); NEW module constant
@@ -4451,13 +5077,16 @@ include `default:trajectory` → `default_trajectory.toml`, v1.8); v1.10: `rubri
 ALWAYS — its stdout is machine-consumed and never touched by console.mode (U13).
 
 v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` and `ExtractStage`
-per their switches at their `_CHAIN_ORDER` slots (§7.9).
+per their switches at their `_CHAIN_ORDER` slots (§7.9). v1.22: under `cfg.segment.enabled` it
+selects `SegmentImageStage` for `mode = "image"` and `SegmentStage` otherwise.
 `labelkit.common.inference.credentials.referenced_profiles()` (the `validate --probe` set) gains
-`segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
+`segment.llm` ONLY when `SegmentConfig.llm_referenced`, and
 `extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern the
-existence/key-resolution/probe sets; v1.11 V3: `segment.llm` never joins the vision set —
-whether window calls attach images is the `segment.vision_resolved` parse product, not a
-validation demand).
+existence/key-resolution/probe sets). Vision follows the same predicate: under UI modality a
+referenced `segment.llm` joins the vision set (rules 4/34/77b). `output.repair_llm` joins it in image
+mode when repair replays images (rule 77c). `segment.vision_resolved` is the parse product that
+decides whether requests attach images (§6.1). Image mode keeps embedding profiles out of the
+reference, credential and probe sets.
 
 v1.9: `build_stages` constructs `StitchStage` (lazy import of `labelkit.operators.stitch`,
 the SegmentStage/ExtractStage convention) at its `_CHAIN_ORDER` slot — between the
@@ -4573,6 +5202,9 @@ Normative behavior:
   R29). Counters OWNED BY M13: `classify.classes.<name>` (counted per label),
   `classify.fallback`, `classify.failures`, `classify.multi_label_records`. `counts.fanout`
   is counted by M10 (len-delta metering, R9/§7.9) — M13 never increments `counts.*`.
+- **v1.22 image mode.** `_fan_out`'s explicit field list adds `regions`, shared by reference.
+  Classification receives neither candidates nor the overlay; a `record.ui_tree is None` record uses the
+  §10.8 no-tree variant.
 - **v1.8 sequence branch** (`record.kind == "sequence"`; spec 3.13.3 sequence row —
   zero-crash guarantee for episodes): the current-record user message follows the §10.8
   sequence variant — `[待分类数据·序列]` followed by all members in occurrence order,
@@ -4628,7 +5260,8 @@ Normative behavior:
 ### 7.14 M14 — `labelkit/operators/segment.py` (v1.8)
 
 (New module, spec 3.14 / `spec/314-m14-segment.md`. Numbered AFTER §7.13 so every frozen
-§7.x anchor stays valid; chain position is the HEAD of the chain — before dedup, §7.9/§2.)
+§7.x anchor stays valid; chain position is the HEAD of the chain — before dedup, §7.9/§2.
+This section describes `segment.mode = "sequence"`; image mode is §7.20.)
 
 Responsibilities: refine one complete candidate session into episodes — active frame
 envelopes (`kind == "single"`) retain session order independently of computation groups
@@ -5073,7 +5706,10 @@ TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结�
                                                       #   annotate._FRAME_SYSTEM_STATIC)
                                                       #   （§10.12/§10.13 冻结模板头；
                                                       #   M1 V13③ 两新段消费）。v1.18 sequence
-                                                      #   不在此表增加整数 head，见下方共享构造器约束
+                                                      #   不在此表增加整数 head，见下方共享构造器约束。
+                                                      #   v1.22 新键 "segment_image" = 410 =
+                                                      #   est_text(segment_image._SYSTEM_STATIC)
+                                                      #   （§10.20，跨层等式测试钉住）；其余键不变
 
 def margin(context_window: int) -> int
 def input_budget(profile: LLMProfile) -> int          # cw − max_output_tokens − margin；cw==0 → 0（预算关）
@@ -5163,6 +5799,9 @@ Binding notes (from dev spec §3.2, normative):
   `_static_prompt_est` for every config (`segment.context` enters the guard as
   `est_text(context) + 1` covering its joining newline); the cross-layer test asserts
   against the same worst-case composition.
+- v1.22 image mode: `_static_checks_prefix` applies
+  `TEMPLATE_HEAD_TOKENS["segment_image"] + est_text(instruction)` when `llm_referenced` and never
+  estimates `segment.context`; sequence mode keeps the "segment" entry under `sequence_resolved`.
 - v1.18 removes every former sequence-generation budget key and does not add six integer
   `generation_*` head constants. The six families share their exact system text, complete user
   scaffold and interpolation order through `common/inference/generation_prompts.py`; M1 and the
@@ -5201,7 +5840,8 @@ Physical ownership is fixed:
 - `common/config/_sequence_layout.py` owns v1.21 timeline/interleaving parsing and derived-count closure.
 - `common/config/_generation_budget.py` owns root examples, fixed content limits and the shared
   six-family context proof.
-- `common/contracts/generation.py` owns the new v1.18 generation carriers in this section.
+- `common/contracts/generation.py` owns the new v1.18 generation carriers in this section;
+  v1.22: the post-validation carriers moved to `common/contracts/post_validation.py` (§7.7).
 - `common/inference/generation_prompts.py` owns all six exact sequence system/user builders shared
   by M1 budget checks and generation operators.
 - Existing generic carriers keep their single canonical owners: RuntimeCredentials in
@@ -5585,34 +6225,8 @@ class StateTransitionInput:
     patch: tuple[JsonObject, ...]
 
 
-@dataclass(frozen=True)
-class PostValidationResult:
-    violations: tuple[str, ...]
-    event_execution: EventExecution | None
-
-
-CallPostValidator: TypeAlias = Callable[
-    [Mapping[str, object]], PostValidationResult
-]
-
-
-@dataclass(frozen=True)
-class PostValidatedCallRequest:
-    profile: str
-    prompt: PromptBundle
-    schema: JsonObject
-    scope: CallScope
-    post_validator: CallPostValidator
-
-
-@dataclass(frozen=True)
-class ValidatedGenerationCall:
-    object: JsonObject
-    event_execution: EventExecution
-    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]
-    usage: Usage
-    attempts: int
-    model: str
+# PostValidationResult, CallPostValidator, PostValidatedCallRequest and ValidatedPostCall are
+# declared in common/contracts/post_validation.py (§7.7); event planning's proof is EventExecution.
 
 
 @dataclass(frozen=True)
@@ -5952,9 +6566,9 @@ non-null only for a declared final event with a mechanically selected branch pos
 EventDraft deliberately has no `role`; EventTruth is not a generation-time history carrier and
 cannot be constructed for a declared branch before independent pattern binding succeeds.
 
-`PostValidationResult`, `PostValidatedCallRequest` and `ValidatedGenerationCall` are declared
-once in `common/contracts/generation.py` and imported by M8; their repetition in §7.7 documents
-M8 ownership, not a second runtime class. RuntimeCredentials, ResolvedHook, ValidationHooks and
+`PostValidationResult`, `PostValidatedCallRequest` and `ValidatedPostCall` are declared
+once in `common/contracts/post_validation.py` and imported by M8, `operators/generation/scenario.py` and
+`operators/generation/state.py` with no alias or re-export (§7.7). RuntimeCredentials, ResolvedHook, ValidationHooks and
 ResolvedPaths remain declared only in the canonical generic modules named in §7.18; their shapes
 are mirrored here only because generation crosses those existing interfaces. `ScenarioBlock` keys are exactly
 `(slot_key, variant_name)`: hidden baseline and instruction-only use `None`; declared delivery
@@ -6601,8 +7215,10 @@ shift. Calendar expansion, fixed-offset ISO8601 projection and CrossView parsing
 21-day calendar horizon outside Python datetime range fails as `generation_plan_infeasible`
 before any content call.
 
-Program digest recursively covers candidate membership, named patterns and weights. Plan digest
-explicitly covers `interleaving_layouts`, global/per-pattern opportunity statistics, exact pair
+Program digest recursively covers candidate membership, named patterns and weights. It excludes
+`ClassView.region_ref_paths` (v1.22): rule 81a keeps that field empty in generation projects, so their
+program digests and every identifier derived from them stay byte-identical. Plan digest explicitly
+covers `interleaving_layouts`, global/per-pattern opportunity statistics, exact pair
 identity and every timestamp/session in blocks. `InterleavingLayout` does not duplicate session,
 timestamp or owner word; those remain uniquely derivable from plan blocks. DeliverySlot does not
 duplicate candidate membership; `source_name` resolves it from the frozen program.
@@ -7127,6 +7743,89 @@ must use the same current forced-pair shape on both revisions. The local gate su
 replaces the real DeepSeek sequence and z.ai structured-output release gates; mock transports and
 recorded responses remain forbidden.
 
+### 7.20 M14 image mode — `labelkit/operators/segment_image.py` (v1.22)
+
+(New module, SPEC-image-region-segmentation §10 / `spec/318-m14-segment-image.md`. Numbered AFTER §7.19 so
+every frozen §7.x anchor stays valid. Chain position is the head of the chain, unchanged, D2.)
+
+```python
+class SegmentImageStage(Stage):
+    name = "segment"
+    def __init__(self, cfg: ResolvedConfig): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+        # returns the SAME list object; writes item.regions and may set failed (§5)
+
+
+# labelkit/operators/segment_geometry.py — the sole production Shapely import point
+def validate_regions(obj: Mapping[str, object], boxes: tuple[ReferenceBox, ...],
+                     width: int, height: int) -> PostValidationResult: ...
+def boxes_as_regions(boxes: tuple[ReferenceBox, ...], width: int, height: int) -> RegionSet: ...  # the D15 route
+```
+
+It takes the ordinary batch path with `session_attempt = None` and does not change `SegmentStage`,
+`judge_window` or `stream_verify`. For each active record it reads the header to get width and height, calls
+the hook if registered and a companion exists, and freezes the boxes; hook failures set `failed`. Only with
+`instruction` does each remaining active record submit one `TaskSpec(resource_key=("llm", segment.llm))`
+through `ctx.run_group`.
+
+| Configuration | Candidates |
+|---|---|
+| `instruction`, no `box_parser` | model from the image only |
+| `instruction` and `box_parser` | model with image and `[参考框]`; each region reuses one box by `box_id` alone (box pixel rectangle, no grid) or draws polygons; unreused boxes do not become candidates |
+| `box_parser`, no `instruction` (D15) | no model call and no runtime task: each box in return order becomes a rectangle with `region_id` = box name, `box_id` and `source_box_ids` naming it, `label_anchor` at its center. `segment.llm` is unreferenced and has no resource key, so any submission would fail with `unknown runtime resource key` |
+| neither | CONFIG_ERROR (rule 74) |
+
+First-round overflow uses `request_overflow(CapacityRequest(segment.llm, prompt, schema), ctx)` from
+`labelkit/common/inference/sequence_evidence.py`. The call is `complete_post_validated` with
+`segment_image_schema()` (§10.7), the §10.20 prompt and `validate_regions` as the request-local validator.
+
+`validate_regions` checks `regions` in order. A step that finds violations reports all of them and skips that
+region's remaining steps; later regions are still checked; all violations return in output order. Texts are the `item` part (M8 adds the
+`(post-validator) ` prefix) and never echo coordinates or model values:
+
+| Step | Check | Violation text |
+|---|---|---|
+| 1 | exactly one of `box_id` and `polygons` is non-null | `/regions/<i>: exactly one of box_id and polygons must be set` |
+| 2a | without reference boxes `box_id` is null | `/regions/<i>/box_id: must be null when no reference boxes are provided` |
+| 2b | `box_id` names a box of this sample | `/regions/<i>/box_id: unknown reference box` |
+| 2c | each box is reused at most once | `/regions/<i>/box_id: reference box reused more than once` |
+| 3 | every ring's first and last positions match | `/regions/<i>/polygons/<j>/exterior: ring is not closed`; `/regions/<i>/polygons/<j>/holes/<k>: ring is not closed` |
+| 4 | Shapely builds each part and checks `is_valid` | `/regions/<i>/polygons/<j>: invalid geometry (<类别>)`, where `<类别>` is `shapely.is_valid_reason` before its first `[`, for example `Self-intersection` |
+| 5 | multipart: `MultiPolygon(parts).is_valid` | `/regions/<i>: parts overlap or share an edge` |
+| 6a | with `box_id`, `source_box_ids` is null or empty | `/regions/<i>/source_box_ids: must be null when box_id is set` |
+| 6b | without reference boxes, `source_box_ids` is null or empty | `/regions/<i>/source_box_ids: must be null or empty when no reference boxes are provided` |
+| 6c | with null `box_id`, each value names a box of this sample | `/regions/<i>/source_box_ids/<k>: unknown reference box` |
+
+Validity is decided on grid integers. Under OGC rules, parts touching at single points are legal, shared edges
+are not, and an island inside a hole is legal. After all checks pass, a `RegionSet` is the proof:
+
+- **Numbering.** A reused region's `region_id` is the box name; drawn polygons number `r1, r2, …` in output
+  order and reused regions take no number. Box names cannot match `r<positive integer>`.
+- **Order.** `RegionSet.regions` follows the model's `regions` array; on the D15 route, hook order.
+- **Normalization.** A reused region has `source_box_ids = (box_id,)`. A drawn region has `box_id = None` and
+  first-seen deduplicated `source_box_ids` (duplicates are not violations); null and empty both become `()`.
+- **Anchor.** A drawn region takes `point_on_surface` of the whole geometry in grid space, projected to float
+  by the §3.1 formula; a reused box takes `((l+r)/2, (t+b)/2)`.
+
+`make_valid`, `buffer(0)`, `orient_polygons` and `set_precision` are forbidden and statically guarded.
+
+Failures are record-level with no `on_error` key. The classifier calls `budget.classify_stage_error` first, then
+uses the standard vocabulary, never the sequence stage's "non-budget error means `segmentation_invalid`" fallback:
+
+| Case | Result |
+|---|---|
+| `box_parser` returns `None` | `companion_invalid`, `failed`; no model call, no repair, not `bad_input` |
+| `box_parser` raises or violates §6.4 | `BoxParserError` → `internal_error`, `failed`; no model call, no repair |
+| first-round precheck or provider overflow | `context_overflow`, `failed`, counts `budget.overflow_records`; a provider 400 terminal feeds the breaker exactly once via `budget.feed_reactive_terminal` |
+| Schema or geometry repair exhausted; repair-round overflow (D11) | `segmentation_invalid`, `stage = "segment"` |
+| truncated output | `output_truncated`, strictly distinct from empty candidates |
+| provider error | `provider_retryable_exhausted` or `provider_fatal`; `CircuitBreakerTripped` and cancellation propagate |
+| validator exception or invalid return | `internal_error`, no L3 |
+| image unreadable after ingest, truncated pixels, `DecompressionBombError` | `image_decode_error`, for every `load_base64` caller |
+| model returns an empty list, or a D15 hook returns `[]` for an existing companion | `RegionSet(regions=())`: legal, not negative, no full-image box, not a reject |
+
+Each success emits one `segment.regions` event (§8.1). Counters `segment_image.*` are M14-owned (§9.3).
+
 ## 8. Observability contract (M12 + ch.7)
 
 ### 8.1 Event catalog (stable contract, `trace_schema_version = 1`, additive-only)
@@ -7136,13 +7835,14 @@ recorded responses remain forbidden.
 | `run.start` | always / info | M10, after M1 passes, before first batch; trace header line | () | `tool_version`, `config_digest`, `project_digest`, `trace_schema_version` (=1, only here) |
 | `run.end` | always / info | M10 after finalize; last trace line | () | `counts` (report-shaped summary), `exit_code` |
 | `batch.start` | always / debug | M10 when PipelineItem[] ready | () | `size` |
-| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)][, `episodes`, `absorbed`, `dropped_noise` — v1.8, segment enabled only (same R20 form)][, `stitched`, `threads` — v1.9, stitch enabled only (same R20 form; per-batch `threads` = batch-local episodes − stitched, §7.9)] |
+| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)][, `episodes`, `absorbed`, `dropped_noise` — v1.8, `segment.sequence_resolved` only (same R20 form)][, `stitched`, `threads` — v1.9, stitch enabled only (same R20 form; per-batch `threads` = batch-local episodes − stitched, §7.9)] |
 | `ingest.bad_line` | ingest / warn | M2 bad line skipped | () | `file`, `line_no`, `reason` |
-| `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"), `file` |
+| `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"\|"companion" — the last is v1.22 image mode), `file` |
 | `ingest.index_conflict` | ingest / warn (error if policy=fail) | M2 index conflict | () | `index`, `files` (list) |
 | `ingest.disorder` | ingest / — (trace-only, no per-event stderr mirror) (v1.8) | M2 when the streaming monotonicity check rejects a record (out-of-order or timestamp parse failure, `stream.on_disorder`, §7.1); skip policy: one event PER RECORD, plus ONE data-free stderr WARN per run logged by M2 itself (the reason embeds timestamp/cursor values and never reaches stderr — spec §7.1 ①); fail policy terminates via InputError (exit 3) | () | `file`, `line_no` (text) \| `index` (UI), `reason` (`out of order: …` \| `timestamp parse failure: …`-class wording, carries the offending values — trace channel only) |
 | `segment.session` | segment / — (trace-only, no stderr mirror) (v1.8) | M2's session assembler closing a candidate session (§7.1; `--limit` truncation treated as EOF flushes the tail session, S17) — emitted by M2 but prefix-routed to the segment channel (S1) | () | `session_id`, `first` / `last` (first/last order keys), `len`, `cause` ("gap"\|"key"\|"max_len"\|"max_span"\|"eof"\|"limit") |
 | `segment.boundary` | segment / — (trace-only, no stderr mirror) (v1.8) | M14 per sliding window once the verdict passes M8 (§7.14); member provenance lives in the payload | () | `session_id`, `window` (= [s, e] frame-ordinal span), `member_ids`, `relations`[]{`index`, `relation` (five-value closed vocabulary, §10.9)}, `model`[, `reason`†] |
+| `segment.regions` | segment / — (trace-only, no stderr mirror) (v1.22) | `SegmentImageStage` per successful record, including the D15 route (§7.20) | (id,) | `regions`, `reused`, `drawn`, `width`, `height`, `attempts` — in this key order, counts only and kept at every tier: `regions = reused + drawn`; D15 `attempts = 0`; no geometry arrays and no box names |
 | `stitch.judge` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per candidate judgment reaching a disposition — pass-1 episode/rescue candidates and pass-2 re-reviews alike, incl. the M-4 votes-split conservative fallback; a FAILED judgment emits `error` instead (§7.16) | (candidate fragment's first member id,) | `session_id`, `candidate` ("episode"\|"rescue"), `repass` (bool), `verdict` ("resume"\|"new"; the fallback records "new"), `thread_ref`, `confidence` (trace observation only, never a gate — T9), `priors` (hit whitelist legs ⊆ {"app_overlap", "entity_overlap", "same_page"}), `merged` (bool)[, `task_name`¶, `reason`¶ — present whenever a judgment object exists][, `votes_split`=true — M-4 split fallback only][, `target_thread_id` — on merge] |
 | `stitch.thread` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per surviving thread envelope at session finalization (§7.16) | (thread record id,) | `session_id`, `thread_id` (== record id == episode_id, T22), `task_name`¶, `fragments` (the `{order_span, member_count, cause, source_episode}` table = `_meta.stream.fragments`, §9.1), `seam_indexes` |
 | `dedup.duplicate` | dedup / — | M3 duplicate verdict | (dup id,) | `kind`, `cluster_key`, `kept_id`, plus exactly one of `jaccard` (near_text) / `hamming` (near_image) / `cosine` (near_semantic); exact dups carry none |
@@ -7191,6 +7891,9 @@ ordinary logging and the frozen error kinds. Sequence generation logs only slot 
 stage, kind, counts, profile and duration. Prompt, ScenarioSeed, state, patch, payload, ActorView,
 EventTrace and hook/exception text never enter ordinary logs or report; existing `llm.call`
 content is available only under trace full and the llm channel. API keys appear at no tier.
+
+v1.22 adds exactly one catalog row, `segment.regions`; the existing segment channel routes it, so the channel
+enumeration, redaction sets, §8.3 tiers and `trace_schema_version` are unchanged.
 
 ### 8.2 Trace line format
 
@@ -7269,8 +7972,12 @@ emitted user object is `Record.raw` (text modality) or
 `{"ui_tree": record.ui_tree.serialize(), "image_path": str(record.image.path)}` (UI modality —
 same shape as the rejects `full`-tier record payload, §9.2); the pre-write `validate_only`
 check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annotation: null`.
+v1.22 image mode: the emitted user object is instead `{"image_path": str}`, plus `"companion_path": str` when a
+companion file exists, from `str(record.image.path)` and `Record.companion_path`. There is no `ui_tree` key and no
+inlined companion byte. Non-image UI records stay `{ui_tree, image_path}` byte for byte.
 
-`_meta` structure (all keys always present; unused stage keys are `null`):
+`_meta` structure (all keys always present, except the conditional `regions` key below — v1.22, the first
+top-level conditional key; unused stage keys are `null`):
 
 ```jsonc
 "_meta": {
@@ -7288,7 +7995,8 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
 
-  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled); key position AFTER
+  // v1.8 — ALWAYS-PRESENT key (null unless segment.sequence_resolved, so always null under
+  // segment.mode = "image"); key position AFTER
   // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
   "stream": null | {
       "episode_id": "<sequence record id>",
@@ -7351,6 +8059,19 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
                                    // placeholder, derived from Transition.detail.kind ==
                                    // "thread_seam" (T10), NEVER from action_type
   },
+  // v1.22 — PRESENT ONLY under segment.mode = "image", where it is always an object, including
+  // annotate-off runs; frozen between "stream" and "scores". Geometry is original-image pixels:
+  // one part {"type": "Polygon", "coordinates": [exterior, *holes]}, several parts
+  // {"type": "MultiPolygon", "coordinates": [[exterior, *holes], ...]}; ring order, vertex order
+  // and numeric types are preserved. boxes is [] without a hook or companion file:
+  "regions": {
+    "image": {"width": <int>, "height": <int>},
+    "boxes": [{"id": "<box name>", "bbox": [<l>, <t>, <r>, <b>], "text": "<str>"}, ...],
+    "items": [{"region_id": "<box name or r<n>>",
+               "geometry": {"type": "Polygon", "coordinates": [[[<x>, <y>], ...]]},
+               "box_id": "<box name>"|null,
+               "source_box_ids": ["<box name>", ...]}, ...]
+  },
   "scores": null | {"<criterion>": <float|null>, ..., "__aggregate__": <float|null>,
                     "mode": "pairwise_bt"|"pointwise", "batch_no": <int>
                     [, "pool": "<label>"]},        // v1.7: pool key ONLY when classify enabled
@@ -7383,6 +8104,11 @@ three stream additions (`thread_id`, `fragments`, per-step `resumed`) are presen
 v1.12: the `members` array is the SOLE addition and is present ONLY when
 `frame.classify.enabled ∨ frame.annotate.enabled` — with frame granularity fully off the
 main output is byte-identical to v1.11.
+v1.22: `regions` is absent outside image mode, so non-image output is byte-identical to v1.21; with it the
+top-level order is id, run, source, stream, regions, scores, dedup, classification, annotation, verification.
+`items[]` equals the §7.4 sample context's `regions[]` element by element, and `boxes` has the same shape as the
+context's `boxes`, all from one `project_regions` result. Sidecar output carries the same block; rule 79 forbids
+`meta_mode = "none"`. The overlay is never emitted (D1).
 v1.18 sequence generation uses the distinct primary-sequence and member-event envelopes in
 §9.5. It does not widen this generic process/flat stream block and does not add a tier or
 time-field generator face.
@@ -7422,6 +8148,8 @@ table:
 | `dropped_lowq` | `quality` | `"below_threshold"` or `"top_ratio"` | |
 | `dropped_verify` | `verify` | `"verify_fail"` | |
 | `failed` | stage of `item.errors[0]` | the first `StageError.kind` | v1.9 adds exactly ONE combination via this rule: (`"stitch"`, `"stitch_invalid"`) — `stitch.on_error = "fail"` episode candidates only (§7.16) |
+| `failed` (v1.22) | `segment` | `"companion_invalid"` | image mode: `box_parser` returned `None`, fixed message `box_parser rejected companion`; no model call, not `bad_input` |
+| `failed` (v1.22) | `segment` | `"segmentation_invalid"` | image mode, record-level: model output still violates the internal Schema or geometry checks after L3, or repair-round overflow (D11); the sequence-mode window-level definition (§4) is unchanged |
 | `dropped_noise` (v1.8) | `segment` | `"noise"` | LLM-judged noise frame; attribution by duck mark (§7.10) — these frames carry no `item.errors` entry |
 | `dropped_noise` (v1.8) | `segment` | `"below_min_len"` | short-segment frame (independent of noise, S11); duck-mark attribution |
 | `dropped_noise` (v1.8) | `verify` | `"off_task_member"` | repair-shrunk member frame (S31); duck-mark attribution — v1.8 adds exactly these THREE `dropped_noise` combinations |
@@ -7445,7 +8173,8 @@ enabling stitch on the same input can flip a strict run's exit code 1 → 0 (res
 below_min_len frames vacate the rejects file) — this is EXPECTED, not a regression.
 `rejects="full"`
 adds `"record"` — text: `Record.raw`; UI:
-`{"ui_tree": serialize(), "image_path": str}`; v1.8 sequence records:
+`{"ui_tree": serialize(), "image_path": str}`; v1.22 image mode: `{"image_path": str}`, plus
+`"companion_path": str` when a companion file exists, with no `ui_tree` key; v1.8 sequence records:
 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25 — the frozen
 single-record payload shapes stay for `kind="single"`) **[FROZEN HERE, v1.8-revised]** —
 and `"raw_last_output"` (for schema_violation ONLY: classification_invalid /
@@ -7491,7 +8220,7 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //     carries each pool's EFFECTIVE mode/rounds; tie_rate emission is gated on "at least
   //     one pairwise pool exists" instead of the global mode (R12/R14);
   // generate.buckets keys gain the class prefix "<class>×<llm>×<style|null>" (§7.5)
-  // v1.8, ONLY when segment.enabled:
+  // v1.8, ONLY when segment.sequence_resolved:
   // counts: + "episodes" (segment-stage len delta, M10-metered — fanout-isomorphic, §7.9),
   //         + "absorbed", + "dropped_noise" (post-emit status tallies, §7.9);
   //         "unprocessed" appearance condition widens in stream mode to
@@ -7541,6 +8270,19 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //     threads deliberately has NO stream.* mirror (single point above, T16);
   //     extract.by_type = per-action-type distribution (S14);
   //     verify sub-block per §7.6 (S31; defects histogram over SIX kinds, v1.9)
+  // v1.22, ONLY under segment.mode = "image" (non-image reports are byte-identical):
+  // counts: + "ignored_files" (after "fanout", before "unprocessed"; IngestReport.ignored_files; outside
+  //         the conservation identity);
+  // "segment_image" block (after "counts" and "estimate", before "dedup" — the "stream" slot; key order frozen):
+  // "segment_image": {"calls": 0, "samples": 0, "boxes": 0, "regions": 0, "empty": 0,
+  //                   "failed": {},
+  //                   "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
+  //   — calls = submitted model tasks excluding L3 (always 0 on the D15 route); samples = active records entering
+  //     the segment stage; boxes/regions = summed RegionSet lengths; empty = records with empty regions;
+  //     failed = {error code: count} for codes seen, keys sorted, {} without failures; usage = segmentation calls
+  //     from ValidatedPostCall.usage plus SchemaViolation.usage on repair exhaustion, splitting segment from
+  //     annotate on one shared profile (a first-round overflow or provider error has no response and adds nothing;
+  //     all zero on the D15 route). A segment-only run omits quality items (D9)
   // v1.11, ONLY when ≥ 1 declared profile carries context_window > 0 (all-undeclared keeps
   // report.json byte-identical to v1.10 — the context-budget byte-equivalence declaration);
   // counts/stats ONLY, never data content (§2.6); key names [FROZEN HERE] (V13②/④/⑤):
@@ -7591,7 +8333,7 @@ callable, endpoint, normalized origin or API-key value.
 [+ fanout]` (the `fanout` term is v1.7: present only under `classify.assignment = "multi"`).
 generate_only degenerates to `emitted + dropped_* + failed = generated [+ fanout]`
 (scanned = bad_input = 0).
-v1.8 — with segment enabled — and v1.9, with stitch enabled — the FULLY EXPANDED form
+v1.8 — with `segment.sequence_resolved` — and v1.9, with stitch enabled — the FULLY EXPANDED form
 (spec §6.4) is:
 
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input
@@ -7688,6 +8430,12 @@ envelope's viewpoint only — fan-out clones share the dict and never re-count i
 CONDITIONAL `report.stream` sub-blocks above. `counts.*` gains NOTHING: frame products
 never change an envelope status, so the conservation identity carries no new term (the
 v1.12 zero-change anchor).
+v1.22 additions (counter key names **[FROZEN HERE]**): `segment_image.calls` / `.samples` / `.boxes` /
+`.regions` / `.empty` / `.failed.<code>` / `.prompt_tokens` / `.completion_tokens` (owner M14 image mode, surfacing
+as `report.segment_image`); `counts.ignored_files` is copied by M10 from `IngestReport.ignored_files`. Image mode
+adds no term to the conservation identity: `companion_invalid` counts in `failed`, ingest-time missing pairs in
+`bad_input`, and episode, absorbed, noise and `unprocessed`-widening terms stay out because they key on
+`segment.sequence_resolved`.
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
 v1.7: this includes `counts.fanout` — M10 meters it as the len-delta around the classify
@@ -8049,7 +8797,7 @@ user (current record):
                   {record.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}
 ```
 
-Process-stream sequence variant (`run.mode == "process"` and `segment.enabled`):
+Process-stream sequence variant (`run.mode == "process"` and `segment.sequence_resolved`):
 
 ```
 user (current record, one message):
@@ -8068,6 +8816,43 @@ all original evidence. Fixed deployment image sizing remains; capacity never rem
 members, samples images or truncates text. The transition line remains
 `{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}`.
 Generation sequence rendering retains its separate existing text-only member-digest path.
+
+Image-mode variant (`AnnotatePromptOptions.regions is not None`, v1.22). System and few-shot messages are
+unchanged, and `TEMPLATE_HEAD_TOKENS["annotate"]` is unchanged:
+
+```
+user (current record, one message):
+  text part:  [原图]
+  image part: record.image
+  text part:  [候选区域叠图]
+  image part: RegionOverlayRef(record.image, regions)
+  text part:  [参考框]\n{render_reference_boxes(regions)}      ← with reference boxes and instruction; D15 omits it
+  text part:  [候选区域]\n{render_candidates(regions)}\n{render_material_note(regions)}
+```
+
+`render_material_note` is exactly this text, where `{width}` and `{height}` are stored original pixels and
+`×` is U+00D7:
+
+```
+原图与候选区域叠图来自同一样本；叠图中每个区域的标识就是该候选的 region_id；候选只是辅助信息，不要求全部选中。引用候选只能用 region_id；没有成为候选的参考框不能被引用。候选与参考框坐标为 0–1000 网格，画布为 {width}×{height} 像素。
+```
+
+The final part is always text, and the repair suffix appends there. Canvas 1080 × 2340, reusing n12 with
+pixel box `[43, 140, 821, 1264]`, renders as:
+
+```
+[参考框]
+{"box_id": "n12", "bbox": [39, 59, 761, 541], "text": "Button 登录"}
+[候选区域]
+[{"region_id": "n12", "polygons": [{"exterior": [[39, 59], [761, 59], [761, 541], [39, 541], [39, 59]], "holes": []}], "box_id": "n12", "source_box_ids": ["n12"], "text": "Button 登录"}]
+```
+
+No classification, filtering, merging or occlusion rule is added.
+
+Defensive path: with `regions is None` and `record.ui_tree is None` (unreachable in the pipeline, because an active
+image-mode record always has a `RegionSet`), `ui_tree.serialize()` is not called and no empty tree section is rendered.
+The current-record message is text `[原图]` and the image part; its final part is then the image, so the repair suffix
+becomes its own text part.
 
 
 ### 10.2 M4 pairwise judging prompt (spec 3.4.3 / the third worked example in spec 3.4.6)
@@ -8092,6 +8877,9 @@ UI modality: the user message replaces each `[记录 X] ...` line with three par
 text `[记录 A 屏幕截图]`, the image part, text `[记录 A UI 控件树]\n{serialize(max_chars=
 input.ui_tree_max_chars)}` (same for B) **[FROZEN HERE labels]**. Record content for text
 modality = `record.text`.
+No-tree variant (`record.ui_tree is None`, v1.22 image mode; receives neither candidates nor the overlay): the user
+message is text `[记录 A 图片]`, the image part, text `[记录 B 图片]`, the image part. Non-image UI records always have a
+tree and keep their bytes; the system text is unchanged, and `quality._ui_parts` fits only the label text.
 
 Process-stream sequence records in pairwise and pointwise prompts use complete evidence:
 
@@ -8132,6 +8920,8 @@ user:
 `{label}` = `criterion.description` up to (excluding) its first `：`, or the whole description if
 it contains no `：` **[FROZEN HERE]** (matches the spec's worked example
 `educational_value（教育/训练价值）`).
+No-tree variant (`record.ui_tree is None`, v1.22 image mode): the user message is text `[记录内容 图片]`, then the
+image part.
 
 ### 10.4 M6 generation prompt (spec 3.6.2; structure fixed, wording frozen here)
 
@@ -8165,6 +8955,22 @@ user:
   [原始数据] {record content — text: record.text; UI: image + tree parts as in 10.2}
   [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
 ```
+
+Image-mode variant (`VerifyPromptOptions.regions is not None`, v1.22). System is unchanged; text and ordinary
+UI templates stay byte-identical as regression anchors:
+
+```
+user (one message):
+  text part:  [任务指令] {instruction}\n[原始数据]\n[原图]
+  image part: record.image
+  text part:  [候选区域叠图]
+  image part: RegionOverlayRef(record.image, regions)
+  text part:  [参考框]\n{render_reference_boxes(regions)}      ← with reference boxes and instruction
+  text part:  [候选区域]\n{render_candidates(regions)}\n{render_material_note(regions)}\n[标注结果] {json.dumps(output, ensure_ascii=False)}
+```
+
+Defensive path, as in §10.1: with `regions is None` and `record.ui_tree is None`, the user message is text
+`[任务指令] {instruction}\n[原始数据]\n[原图]`, the image part, then text `[标注结果] {json.dumps(output, ensure_ascii=False)}`.
 
 Repair suffix appended (as additional text at the end of the final user message) to the §10.1
 annotation prompt when re-annotating (`RepairContext`):
@@ -8239,7 +9045,7 @@ Process record annotations preserve the first assembled prompt when `retain_repa
 then append the previous model-space output and violations. Unlike process-stream `complete_evidence`,
 this does not propagate repair overflow out of M8; ordinary SchemaViolation accounting remains unchanged.
 
-### 10.6.1 M8 EventPlan post-validator repair dialogue (v1.18, verbatim)
+### 10.6.1 M8 generic post-validator repair dialogue (v1.18, generalized v1.22, verbatim)
 
 `complete_post_validated` replays every message from the original
 `PostValidatedCallRequest.prompt` unchanged, then appends exactly two messages:
@@ -8255,8 +9061,15 @@ user message:
 只输出修正后的 JSON。
 ```
 
-The replay adds no state beyond the prompt-safe ActorView/visible state that the original call
-already contained. It never serializes EventExecution, hidden state, hook exceptions or new facts.
+This dialogue serves every `complete_post_validated` caller. Post-validator violations carry the
+`(post-validator) ` prefix. Replay retains every original part, image and `image_px`, and never reads
+`retain_repair_prompt`. L3 rounds are `min(max_repair_attempts, 2)`. A repair round that overflows ends the call
+with `SchemaViolation` and never surfaces as `context_overflow` (D11); the caller then classifies the record,
+event planning through its slot rejection and image-mode segment as `segmentation_invalid`.
+
+For event planning, the replay adds no state beyond the prompt-safe ActorView/visible state that the original call
+already contained. It never serializes EventExecution, hidden state, hook exceptions or new facts. For image-mode
+segment, violations never echo coordinates or model values (§7.20).
 The generic `complete_validated` repair dialogue remains the single-user-message form in §10.6.
 
 ### 10.7 Internal schemas (M8 module constants; exact JSON)
@@ -8588,6 +9401,34 @@ the complete selected user frame Schema unchanged. Frame binding never rewrites 
 after the LLM returns a full Schema-valid object, code applies the ordered exact binding values
 to a deep copy with RFC 6902 `add` semantics and validates the same complete Schema again. No
 deleted sequence-specific Schema-builder symbol exists.
+
+v1.22 adds `segment_image_schema()` (M14 image mode; internal treatment, no L2.5 and no `resolved_at`
+counting). Its keywords are a subset of the existing internal set: no `$ref`/`$defs`, every key required,
+nullable through type unions, no `uniqueItems`. The ring is built once and used at both places:
+
+```python
+def segment_image_schema() -> dict:
+    ring = {"type": "array", "minItems": 4, "items": {
+        "type": "array", "minItems": 2, "maxItems": 2,
+        "items": {"type": "integer", "minimum": 0, "maximum": 1000}}}
+    return {"type": "object", "additionalProperties": False, "required": ["regions"],
+            "properties": {"regions": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["box_id", "polygons", "source_box_ids"],
+                "properties": {
+                    "box_id": {"type": ["string", "null"]},
+                    "polygons": {"type": ["array", "null"], "minItems": 1, "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["exterior", "holes"],
+                        "properties": {"exterior": ring,
+                                       "holes": {"type": "array", "items": ring}}}},
+                    "source_box_ids": {"type": ["array", "null"],
+                                       "items": {"type": "string"}}}}}}}
+```
+
+Exactly one of `box_id` and `polygons` being non-null is not expressible in the strict safe subset and is
+checked by `validate_regions` (§7.20).
+
 ### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
 
 ```
@@ -8614,6 +9455,9 @@ variant. UI modality: the current-record user message is THREE parts — text `[
 image part (encoded by M9 at call time), text `[UI 控件树]\n{serialize(...)}` — the same
 single-record assembly shape as §10.1 (R27). Deterministic string concatenation throughout;
 class table and per-class examples follow `[[classify.classes]]` declaration order.
+
+No-tree variant (`record.ui_tree is None`, v1.22 image mode; receives neither candidates nor the overlay): the
+current-record user message is text `[图片]`, then the image part. The system text is unchanged.
 
 Process-stream classification sequence variant:
 
@@ -9366,6 +10210,33 @@ data-minimized violations. Event-plan post-validation never
 injects state, EventExecution or hook exception text into repair. Frame binding application and
 its final full-Schema revalidation occur after M8 success and never enter L3.
 
+### 10.20 M14 segment image prompt (SPEC-image-region-segmentation §10.2, verbatim; v1.22)
+
+The system message is one text part: the module constant `segment_image._SYSTEM_STATIC` below, lines joined by
+`\n` with no trailing newline, immediately followed by `\n{segment.instruction}`.
+`TEMPLATE_HEAD_TOKENS["segment_image"] = 410 = est_text(_SYSTEM_STATIC)`.
+
+```text
+你负责为图片生成候选区域。坐标使用 0–1000 整数网格：x 是相对图片宽度的千分位，y 是相对图片高度的千分位，原点在左上角。
+每个区域由一个或多个多边形组成；每个多边形给出闭合的外环（至少 4 个点，最后一个点与第一个点相同），可以给出同样闭合的内环表示孔洞。同一区域的多个多边形之间不能重叠，也不能共用边；相邻的部分请合并成一个多边形。孔洞不能与外环共用边。不要输出区域编号。
+提供了参考框时，每个区域二选一：复用一个参考框时只填 box_id，polygons 与 source_box_ids 都填 null；画新多边形时 box_id 填 null，可以在 source_box_ids 中列出参考了哪些框（不要重复）。同一个参考框最多复用一次。未提供参考框时 box_id 与 source_box_ids 都填 null。没有符合指令的区域时输出空列表。
+输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+{"regions": [{"box_id": <参考框 box_id|null>, "polygons": [{"exterior": [[x, y], ...], "holes": [[[x, y], ...], ...]}, ...]|null, "source_box_ids": [<参考框 box_id>, ...]|null}, ...]}
+[分割指令]
+```
+
+One user message; images appear only here:
+
+```text
+text part:  [图片]
+image part: record.image
+text part:  [参考框]\n{render_reference_boxes(regions)}      ← with reference boxes
+text part:  本样本没有参考框。                                ← without reference boxes, including a hook returning []
+```
+
+Response validated against `segment_image_schema()` (§10.7) and `validate_regions` (§7.20) through
+`complete_post_validated`; L3 follows §10.6.1.
+
 ## 11. Cross-cutting conventions (binding)
 
 1. **Async everywhere LLM is involved.** `Stage.run`, `complete_validated`, `complete`, `embed`,
@@ -9614,7 +10485,7 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - redaction: `_DATA_KEYS = {"target","value"}` stripped at none/refs;
       `_FREE_TEXT_KEYS += "description"` (S27, §8.3); the three segment/extract events are
       trace-only (no stderr mirror);
-    - trajectory rubric (S29): empty `quality.rubric` under `segment.enabled` resolves to
+    - trajectory rubric (S29): empty `quality.rubric` under `segment.sequence_resolved` (v1.22 rekey) resolves to
       `"default:trajectory"` (packaged `default_trajectory.toml`, rubric name
       `default-trajectory-v1`); trajectory + `extract.enabled=false` → warning
       ("步骤" degrades to "帧间变化");
@@ -9921,4 +10792,42 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     success report cover the frozen configuration, opportunities, selections and layout identity.
     The product revision is v1.21, while `labelkit:v1.20` deliberately remains the independent
     artifact-encoding domain for IDs, stream exact material and delivery digest.
+37. **v1.22 图片候选区域分割冻结点** — feature spec `docs/dev/SPEC-image-region-segmentation.md`, requirement
+    record `docs/dev/PROPOSAL-image-region-segmentation.md`; D1–D15 closed there. Key frozen points:
+    - **mode split**: `segment.mode = "image"|"sequence"` is required when enabled, with no default, alias or
+      migration. `SegmentConfig.sequence_resolved` and `llm_referenced` rekey the 52 code judgments (37 stream,
+      4 stage-in-chain, 11 set membership). Rules 72–81 are new; rules 17, 29, 33 and 34 are revised;
+    - **geometry**: model side 0–1000 integer grid; truth is original pixels, never rounded; projected
+      once; outward rounding for box-derived display and half-even for drawn polygons, both exact rational;
+      the canvas is the stored pixel grid and EXIF orientation is not handled (D3, D4);
+    - **carriers**: `ReferenceBox`, `RegionPolygon`, `CandidateRegion`, `RegionSet`, `RegionOverlayRef`,
+      `scaled_size`, `PipelineItem.regions`, `Record.companion`, `companion_path`, `image_sha256`,
+      `companion_sha256`, and the image-mode id rule `sha256(companion_bytes + image_bytes)[:16]`;
+    - **overlay**: `OVERLAY_FILL_ALPHA = 64`, `OVERLAY_OUTLINE_PX = 1`, the eight `OVERLAY_COLORS`, white base,
+      label size `max(12, round(long_edge * 0.012))`, white text with black stroke of
+      `max(1, font_size // 8)`, RGB PNG only, never written to disk (D1, D12). No output channel is added;
+    - **hook**: `segment.box_parser` is the fifth hook form, `companion_suffix` travels with it, box names follow
+      D13, boxes are axis-aligned rectangles (D14), validation order is frozen, `BoxParserError` carries fixed
+      reasons, and `companion_invalid` is a new `ErrorKind`;
+    - **routes**: `instruction` alone, `instruction` plus `box_parser`, and `box_parser` alone with no model call
+      or runtime task (D15). Segment-only runs need `instruction` (D9); the chain tuple is unchanged (D2);
+    - **seam**: `common/contracts/post_validation.py` holds `PostValidationResult`, `PostValidatedCallRequest` and
+      `ValidatedPostCall`, with `proof` replacing `event_execution` and no alias; `SchemaViolation.usage` carries
+      repair-exhaustion cost;
+    - **references**: `x-labelkit-region-ref`, `ClassView.region_ref_paths`, `ResolvedConfig.region_ref_paths`,
+      `CallScope.region_ids` and `CallScope.region_ref_paths`, with the unknown-value text
+      `<concrete-pointer>: unknown region reference` (D6);
+    - **capacity**: positive `context_window` for every referenced profile; candidates and reference boxes are never
+      trimmed; repair and judge overflow keep their current attribution (D11); `TEMPLATE_HEAD_TOKENS["segment_image"] = 410`;
+    - **quality and dedup**: an empty rubric is an error, with no `default:image` rubric (D10); the exact key is
+      `["labelkit:image", "exact", <image_sha256>, <companion_sha256 or null>]`; reference-box text is the tree side;
+      `"both"` degrades to `"image"` without boxes; the semantic layer does not apply;
+    - **output**: `_meta.regions` sits between `stream` and `scores` and is the first top-level conditional key;
+      `report.segment_image`, `counts.ignored_files`, the `segment.regions` event and the image-mode record payload
+      `{image_path[, companion_path]}` are new;
+    - **prompts**: §10.20 and the variants in §10.1, §10.2, §10.3, §10.5 and §10.8, with labels `[原图]`, `[候选区域叠图]`,
+      `[参考框]`, `[候选区域]`, `[图片]`, `[记录 A 图片]` and `[记录内容 图片]`; the no-tree branch is
+      `record.ui_tree is None`; the trace excerpt source is `""`;
+    - **dependencies**: `shapely==2.2.0` imported only by `labelkit/operators/segment_geometry.py`, and `Pillow>=10.1`;
+    - **evidence**: real-endpoint gates are z.ai only (D7) and remain `[PENDING-EVIDENCE:<name>]` until run.
 — End of contract. —

@@ -1,0 +1,40 @@
+# 纯图片（模型路径）：没有伴随文件，segment 只依据图片生成候选，annotate 按 region_id 选择并标注。
+# 图片模式恒无控件树，quality 没有默认 rubric，必须显式关闭或指定。
+schema_version = 1
+
+[run]
+input = "./data/photos"
+output = "./out/photos.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[segment]
+enabled = true
+mode = "image"
+llm = "default"
+instruction = """
+为图片中可以独立指认的物体生成候选区域，保留它们的实际轮廓。
+"""
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:keep_polygons"
+instruction = """
+判断每个候选区域是什么物体。通过 region_id 引用候选，label 写物体名称；与物体无关的候选不要选。
+"""
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-polygons.json"
+meta_mode = "inline"
+rejects = "refs"

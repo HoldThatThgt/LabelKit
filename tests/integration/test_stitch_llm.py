@@ -106,7 +106,7 @@ def make_cfg(votes: int = 1) -> ResolvedConfig:
         input=InputConfig(),
         stream=StreamConfig(),
         dedup=DedupConfig(),
-        segment=SegmentConfig(enabled=True, strategy="hybrid", llm="default"),
+        segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid", llm="default"),
         stitch=StitchConfig(enabled=True, llm="default", context=STITCH_CONTEXT,
                             votes=votes),
         extract=ExtractConfig(),

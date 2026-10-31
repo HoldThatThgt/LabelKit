@@ -361,7 +361,7 @@ class ConsoleRenderer:
             enabled["generate"] = False
         self._chain = tuple(n for n in _CHAIN_ORDER if enabled[n])
         badge = f"{cfg.run.mode}/{cfg.run.modality}"
-        if cfg.segment.enabled:
+        if cfg.segment.sequence_resolved:
             badge += "/stream" + ("+stitch" if cfg.stitch.enabled else "")
         self._mode_badge = badge
 
@@ -1182,7 +1182,7 @@ class ConsoleRenderer:
         seg = (f" account  emitted {acc['emitted']}   dup {acc['dup']}   "
                f"lowq {acc['lowq']}   verify {acc['verify']}   "
                f"failed {acc['failed']}")
-        if self._cfg.segment.enabled:
+        if self._cfg.segment.sequence_resolved:
             seg += f"   noise {acc['noise']}   absorbed {acc['absorbed']}"
         if self._cfg.stitch.enabled:
             threads = counters.get("counts.threads", acc["threads"])
@@ -1442,7 +1442,7 @@ class ConsoleRenderer:
             self._console.print(self._Text(
                 "note: estimated with global config / multi reports a lower "
                 "bound at label multiplier 1"))
-        if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+        if cfg.segment.sequence_resolved and cfg.segment.strategy in ("llm", "hybrid"):
             self._console.print(self._Text(
                 "note: stream estimate: downstream reports a lower bound at "
                 "episodes≈sessions (LLM refinement only adds segments)"))

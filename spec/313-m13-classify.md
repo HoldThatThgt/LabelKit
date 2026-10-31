@@ -33,7 +33,9 @@ user (当前记录):
 
 UI 模态的「当前记录」Part 组装与 3.5.2 相同（`[屏幕截图]` 为 `kind="image"` 的 Part，`[UI 控件树]` 为 `kind="text"` 的 Part，3.9.2），所引 profile 须 `supports_vision = true`（M1 校验，3.1.4）。类别示例 `examples` 仅输入侧——分类的输出格式由内部 Schema 钉死，无「示例输出」段。`reason` 的请求条件见 3.13.4 调用与校验行。
 
-**处理序列的完整证据。**`run.mode="process"` 且 `segment.enabled=true` 时，分类作用于会话终结后的完整序列。
+**图片模式无树变体（v1.22，CONTRACTS §10.8）。**图片模式恒不构造 `UITree`，分支判据是 `record.ui_tree is None`（非图片 UI 记录恒有树，所以非图片字节不变）：当前记录为 text part `[图片]` 加 image part `record.image`，省略 `[屏幕截图]` 与 `[UI 控件树]` 段，其余 system 文本不变。classify 不接收候选和叠图。
+
+**处理序列的完整证据。**`run.mode="process"` 且 `segment.sequence_resolved=true` 时，分类作用于会话终结后的完整序列。
 当前记录消息按成员顺序包含每个成员的完整 `record.text`，或完整 `UITree.serialize(max_chars=None)` 与每张截图。
 共同渲染器是 `record_evidence` / `sequence_parts`；`input.ui_tree_max_chars` 只约束普通单记录 UI，不裁处理序列。
 图片保留 profile 的固定工作点，在真正序列化请求时惰性编码；预览不加载字节。系统指令、类别表、few-shot 和模型 Schema
@@ -69,7 +71,7 @@ def classification_schema(class_names: list[str], assignment: str,
 | 归一化（M8 之后，确定性，顺序固定） | ① 标签映射到类别表声明序并**去重**；② 兜底类与具体类同现 ⇒ 剔除兜底类（纯兜底保留——「其余」与具体类命中矛盾）。归一化只收窄已验证集合（词表合法性由内部 Schema enum 保证，3.13.3）。 |
 | sc 投票 | `classify.self_consistency = n`（0 关；≥3 奇数，M1 校验）：n 次独立采样（某次采样 SchemaViolation ⇒ 该样本弃权，分母仍为 n）。single：多数票，无过半 ⇒ 归兜底类；multi：逐标签保留出现于 > n/2 个采样集合者，全落选 ⇒ 归兜底类。`Classification.detail.sc = {"n", "agreement_ratio"}`（single = 胜出类票占比；multi = 保留标签中最低票占比）。本投票不复用 3.5.2 的字段级投票——其「全体分歧回退首样本」语义不适用于分类（无过半应归兜底而非取首样本）。 |
 | 失败与兜底 | M8 修复耗尽：`classify.on_error = "fallback"`（默认）⇒ 归兜底类 `classify.fallback_class`，`source="fallback"`，留痕写 `Classification.detail`（含 kind 与消息）——**不写 `item.errors`**（记录存活；rejects 归因取 `item.errors[0]`，写入会在该记录后续阶段失败时污染归因，3.11.2）+ error 事件（kind = `classification_invalid`，7.6）+ 计数器 `classify.fallback`；`on_error = "fail"` ⇒ `status="failed"`、StageError 入 `item.errors` ⇒ rejects。 |
-| multi 扇出 | 原信封取首标签，其余标签按声明序追加兄弟信封。兄弟共享当前尝试的 record、dedup、member_classifications 与 member_annotations；复制 session_id、session_position、member_positions、capacity、thread_id、segment_degraded、seam_indexes、seam_interrupted_by、stitch_fragments、stitch_task_name。scores、annotation、verification、errors 为全新容器，transitions 保持 None 供各 label 独立摘取。会话重算从冻结上游重建，禁止把上次尝试的帧产品复用到新尝试。扇出后独立类路由与淘汰，净增仍由 M10 计量。 |
+| multi 扇出 | 原信封取首标签，其余标签按声明序追加兄弟信封。兄弟共享当前尝试的 record、dedup、member_classifications 与 member_annotations；复制 session_id、session_position、member_positions、capacity、thread_id、segment_degraded、seam_indexes、seam_interrupted_by、stitch_fragments、stitch_task_name。scores、annotation、verification、errors 为全新容器，transitions 保持 None 供各 label 独立摘取。会话重算从冻结上游重建，禁止把上次尝试的帧产品复用到新尝试。扇出后独立类路由与淘汰，净增仍由 M10 计量。 （v1.22）`_fan_out` 字段清单加入 `regions`，兄弟信封按引用共享同一冻结 `RegionSet`。 |
 | multi × episode（v1.8，S9） | stream 模式下 multi 扇出照常作用于序列信封，两点增量语义：① 克隆兄弟的 `transitions` **恒为 None**——extract 链序在 classify **之后**（3.10.3），每个兄弟按**各自 label** 的有效 `[class.<label>.extract]` instruction 独立摘取（per-label 白名单承诺兑现；transitions 每信封自持，×k 摘取成本接受——episode 命中多类应属罕见：M14 边界判据即「单一目标导向活动」，3.14.4；dry-run 沿本表 multi 惯例按乘数 1 报下界，3.10.3）。② **共享语义边界声明**：本表「multi 扇出」行的「克隆共享 `record` 引用」不变量仅维持到 M7 成员手术为止——被修复兄弟的 `record` 分叉（以新成员集重建，3.7.3 stream 修复路由），同 `_meta.id` 的兄弟输出行自此 `member_ids` **可不同**，以 `_meta.stream.repaired` 消歧（6.3）；membership 类手术仅原信封（首标签）可执行、克隆兄弟降为只标记（S8，3.7.3）。 |
 | 幂等与 sequence 边界 | `classification is not None` 的项跳过，覆盖 flat 回流样本的 inherited 分类与任何重入。v1.18 sequence 要求 `classify.enabled = false`，ClassifyStage 不进链；sequence class 直接由 `[class.<name>]` 声明，EventProjector 在主序列与成员事件上写 `source="inherited"` 的实际类真值。因此 sequence 的分类调用恒为零，但 M4/M5/M7/M11 必须继续读取 inherited Classification 选择 ClassView。 |
 | 事件与计数 | 每记录一条 `classify.decision` trace 事件（classify 通道 / trace-only，payload：`label`、`labels`（multi 携带全集）、`source`、`reason`†、`sc`†；条件与字段定义见 7.2）；计数器（M13 属主）：`classify.classes.<name>`（逐标签计）、`classify.fallback`、`classify.failures`、`classify.multi_label_records`；`counts.fanout` 由 M10 计量（counts.* 所有权属 M10，3.10.3）。report `classify` 节见 6.4。 |

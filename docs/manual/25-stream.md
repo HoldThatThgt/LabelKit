@@ -64,7 +64,7 @@ flowchart LR
 
 一条与真实数据打交道时躲不开的指引：用户常在任务间来回切换——外卖点到一半切去回消息、回来接着下单，这种**穿插**会让分段把同一个任务正确地切成多个碎片（分段的单元本来就是「连续做一件事」）。本章通篇讲的是不缝合的基线形态；要把穿插碎片按任务线索缝回完整记录，开 v1.9 的缝合算子（`[stitch]`，第 26 章）。
 
-这套形态不是发明：从状态对反推动作是 OpenAI VPT 的逆动力学模型与 OS-Genesis 逆向任务合成的既有工序，滑窗 LLM 边界裁决是 2026 年 GUI 轨迹量产管线（Video2GUI 等）仍在用的形态之一，LabelKit 按自己的负边界（不训练本地模型）用运行时 LLM 充当这两个角色。**什么时候开**：输入是按时间排好的操作流（UI 模态的截图 + 树对，或带时间戳的文本事件流）、且你要的样本单位是「活动段」而非单条记录。开关是 `segment.enabled = true`，约束：仅 process 模式、必须开 annotate、与 generate 互斥；`extract` 再要求 UI 模态。默认全关——不开时行为与 v1.7 逐字节一致（输出只多一个恒为 null 的 `_meta.stream` 键）。
+这套形态不是发明：从状态对反推动作是 OpenAI VPT 的逆动力学模型与 OS-Genesis 逆向任务合成的既有工序，滑窗 LLM 边界裁决是 2026 年 GUI 轨迹量产管线（Video2GUI 等）仍在用的形态之一，LabelKit 按自己的负边界（不训练本地模型）用运行时 LLM 充当这两个角色。**什么时候开**：输入是按时间排好的操作流（UI 模态的截图 + 树对，或带时间戳的文本事件流）、且你要的样本单位是「活动段」而非单条记录。开关是 `segment.enabled = true` 加 `segment.mode = "sequence"`（`mode` 启用时必填；`"image"` 是独立图片的候选区域分割，见第 28 章），约束：仅 process 模式、必须开 annotate、与 generate 互斥；`extract` 再要求 UI 模态。默认全关——不开时行为与 v1.7 逐字节一致（输出只多一个恒为 null 的 `_meta.stream` 键）。
 
 **手上没有真实流呢？** sequence form（第 27 章）可以从零生成 main 与逐事件 stream；它在内容调用前冻结
 ScenarioPlan，并在成功下游之后才从最终 source rows 派生 replay。生成侧不运行 segment/stitch/extract。
@@ -83,7 +83,8 @@ order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅�
 key = ["source_dir"]              # 分区键：每个场景子目录一个会话
 
 [segment]
-enabled = true                    # stream 模式总开关
+enabled = true                    # segment 阶段开关
+mode = "sequence"                 # 时序流分割（启用时必填）
 strategy = "hybrid"               # 滑窗 LLM 边界精化 + 逐帧噪声标记
 window = 16                       # 窗上限，≥ 最长会话（15 帧）：预算装得下整段 ⇒ 每会话恰一窗（25.5）
 min_len = 2                       # 仅作用于 LLM 精化切出的段
@@ -400,7 +401,7 @@ enabled = false
 ```
 
 **组合约束**（全部启动期检查，第 4 章有合订）：process stream 的帧粒度开关要求
-`segment.enabled = true` 且 `output.meta_mode != "none"`；frame class 必须来自分类闭集，帧级没有 multi 或
+`segment.enabled = true`、`segment.mode = "sequence"` 且 `output.meta_mode != "none"`；frame class 必须来自分类闭集，帧级没有 multi 或
 self-consistency。sequence form 则要求两个分类开关都关闭，以 `[frame.class.<name>]` 注册 frame class，
 并在 `[frame.class.<name>.generate]` 声明 instruction 与 object Schema。两种形态共用概念，不共用判决路径。
 

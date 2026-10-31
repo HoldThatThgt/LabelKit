@@ -181,6 +181,8 @@ def check_annotation(obj: dict, record: dict | None) -> list[str]:
 
 生成侧有一个孪生钩子 `generate.sample_validator`（签名 `fn(text) -> list[str]`），语义是**过滤器**而非 LLM 修复环：违规样本直接剔除、计入桶统计，详见第 12 章。
 
+图片模式（v1.22）下回调的第二入参是框架绑定的样本上下文，而不是 `None`；启动干跑仍以 `None` 调用，回调必须处理这种情况（第 11 章 11.9）。未知 region_id 不必写进回调，用 14.9 的注解。
+
 ### 三种用户 Schema，三种待遇
 
 用户可声明三类 Schema，它们的待遇不同：
@@ -222,6 +224,7 @@ repair、token 与 trace 仍完整记账。
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 Bradley-Terry 中性），计入 `report.quality.judgment_failures`；
 - 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；
 - 分类结果的内部 Schema 用 enum 封闭集锁死类名；multi 重复标签在 Schema 通过后确定性归一化。
+- 图片模式 segment 的内部 Schema 规定候选结构、0–1000 整数坐标与顶点数；其后的几何检查（环闭合、`Self-intersection` 之类的非法几何、部件共边）走同一个可修复的后校验接缝，修复最多两轮，违规不回显坐标（第 28 章）。框架不调用任何几何修复函数。
 - sequence 的每个 frame class 必须是完整 object Schema。系统先按 payload binding 覆盖权威 state value，再由
   generic candidate finalizer 注入业务时间并复验完整 Schema；model Schema 与 L3 都不携带机械时间，不能通过改写
   Schema 或把 authoritative value 送进 L3 来掩盖冲突。
@@ -237,3 +240,109 @@ repair、token 与 trace 仍完整记账。
   z.ai 1 passed in 60.81s；显式双-noise 与两条 failure injection 均走生产 LLMClient 与真实服务端。
 
 这就是「LLM 输出不可信」原则的完整落地：**没有任何一条 LLM 文本能绕过校验进入任何下游**。
+
+## 14.8 `segment.box_parser`：把伴随数据转成参考框（v1.22）
+
+图片模式下 LabelKit 不解释伴随数据：它可能是 uiautomator XML、无障碍 JSON、OCR 结果或别的格式，框架不嗅探内容，也不用正则抽取。工程注册一个钩子，把自己的格式转成统一的参考框数组，框架只严格校验这个数组。**是否注册钩子本身就是声明**：不注册就不读伴随文件。
+
+```toml
+[segment]
+enabled = true
+mode = "image"
+box_parser = "hooks.py:uiautomator_to_boxes"   # 相对工程根目录
+companion_suffix = ".xml"                      # image_7.png 配 image_7.xml
+```
+
+**签名。**必须是同步函数，恰好两个位置参数且都没有默认值，比后处理更严。异步函数、生成器、可变参数、额外参数都在启动时拒绝（退出码 2）。启动时只检查签名，不执行。
+
+```python
+def uiautomator_to_boxes(companion: bytes, image: dict) -> list[dict] | None:
+    """companion 是伴随文件的原始字节，由钩子自行解码；image 是 {"width": W, "height": H}，原图存储像素。"""
+```
+
+**返回值只有三种语义，不要混用：**
+
+| 返回 | 含义 | 结果 |
+|---|---|---|
+| 非空 `list` | 这些是参考框 | 冻结进样本，所有下游共用同一份 |
+| `[]` | 数据合法，但没有框 | 继续：有 `instruction` 时模型依据图片生成候选，没有时是合法的空候选 |
+| `None` | 数据无法解析，拒收本样本 | 记录以 `companion_invalid` 失败，不调用模型，不计 `bad_input` |
+
+**不要写 `except: return []`。**这会把解析失败伪装成「这张图没有框」，错误数据不再有任何信号。无法解析就返回 `None`，空树或只有窗口外壳才返回 `[]` 或一个外壳框。这些策略写在你的代码里。
+
+**参考框格式。**每项恰好是含 `bbox`、`text` 与可选 `id` 的 `dict`，不允许其他键：
+
+| 字段 | 规则 |
+|---|---|
+| `id` | 框名。要么每个框都给非空 `id`，要么每个框都留空（省略或 `""`）。全部留空时框架按数组顺序补为字符串 `"1"…"N"`；只命名一部分被拒。给出的框名 1–64 个字符，只含 `[A-Za-z0-9_.:-]`，样本内唯一，不得形如 `r<正整数>`（留给模型新画的多边形）。`null` 与非字符串被拒 |
+| `bbox` | `[l, t, r, b]` 列表，原图像素，整数或有限浮点（不接受布尔、NaN、无穷）；`0 ≤ l < r ≤ width`，`0 ≤ t < b ≤ height` |
+| `text` | 字符串，可为空，可含换行，给模型看的描述。渲染时经 JSON 转义，任何 text 都不能伪造出另一行参考框 |
+
+框架**不裁剪、不取整、不去重、不合并**。超出画布或零面积的框是钩子的错误，由你决定裁剪还是丢弃。违反上述规则、抛异常、返回元组都是程序错误：该记录以 `internal_error` 失败，其余记录继续，不调用模型，不进修复（重试无意义）。日志只有固定原因（`exception`、`return_type`、`invalid_json`、`invalid_box`）、框序号与钩子引用，不记数据。实跑一个只给第 0 个框命名的钩子（`box_index` 从 0 计）：
+
+```text
+box_parser failed: reason=invalid_box box_index=1 hook=...hooks.py:broken_hook
+error stage=segment kind=internal_error message=BoxParserError: invalid_box retryable=False
+```
+
+这种钩子让每条记录都失败，而退出码仍是 0，只有 `report.counts.failed` 与 `report.segment_image.failed` 能看出来。上线前跑一次小样本，生产运行配 `--strict`。
+
+**怎么写好一个钩子：**
+
+- **只输出有意义的节点**：可见、有文字或可交互。参考框块不裁剪，钩子输出数百个框时每张图就有数百行提示，超窗以 `context_overflow` 失败。
+- **框名简短**（例如 `n12`）。来自参考框的候选以框名作为 `region_id`，框名会直接画进叠图和提示词。
+- **剔除 bbox 完全相同的嵌套框**。框架不去重，这是业务选择；不剔除的话，只用参考框的路径下这些候选的标识画在同一点上，模型分不清。同一条父子链上 bbox 相同的框只留一个：有文字或名称的节点优先，都有或都没有时留最内层；兄弟节点不算嵌套，不合并。所以包着带字 Button 的可点击 FrameLayout 留下 Button，带 `content-desc` 的 View 里套一个空的可点击 ImageView 时留下 View。
+
+  这一步要在遍历树时做，那时还拿得到节点自身的文字和父子关系。`examples/image-segmentation/hooks.py` 的 `uiautomator_to_boxes` 与 `accessibility_to_boxes` 都这样做，可以照抄其中的 `_add_box`。不要等框转完再对数组按 bbox 去重：遍历先到父节点，「先见先留」会留下没有文字的外层容器、丢掉带文字的子节点，还会误删同框的兄弟节点。
+- **保持纯函数和轻量**：不读文件、不联网、不依赖随机性。它在事件循环线程上同步执行，解析很大的文件会推迟同批其他请求。每个样本恰好调用一次，classify 扇出、修复、verify 返工都不再调用；`validate` 与 `--dry-run` 也不调用。
+- 框要和图片的存储像素对齐，由你负责（第 5 章 5.6）。
+
+**单测写法。**钩子是普通 Python 函数，直接测；要连框架的校验一起测，用 `invoke_box_parser`，它返回校验并补名后的框，钩子返回 `None` 时返回 `None`。下面这个文件实跑 `3 passed`：
+
+```python
+import json
+from labelkit.common.extensions.box_parser import invoke_box_parser
+from labelkit.common.extensions.hooks import ResolvedHook
+
+
+def ocr_to_boxes(companion: bytes, image: dict) -> list[dict] | None:
+    try:
+        lines = json.loads(companion)["lines"]
+        return [{"bbox": line["bbox"], "text": line["text"]} for line in lines]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def check(companion: bytes, width: int, height: int):
+    return invoke_box_parser(ResolvedHook("hooks.py:ocr_to_boxes", ocr_to_boxes), companion, width, height)
+
+
+def test_named_by_framework():
+    boxes = check(b'{"lines": [{"text": "Total", "bbox": [10, 20, 110, 40]}]}', 800, 1000)
+    assert [(box.box_id, box.bbox, box.text) for box in boxes] == [("1", (10, 20, 110, 40), "Total")]
+
+
+def test_empty_is_not_rejection():
+    assert check(b'{"lines": []}', 800, 1000) == ()
+
+
+def test_foreign_data_is_rejected():
+    assert check(b"not json", 800, 1000) is None
+```
+
+可直接运行的三种钩子（uiautomator XML、无障碍 JSON、OCR JSON）见 `examples/image-segmentation/hooks.py`。
+
+## 14.9 `x-labelkit-region-ref`：可修复的区域引用（v1.22）
+
+图片模式下给输出 Schema 的字段标这个注解，模型引用不存在的候选时进入修复，不会走到后处理：
+
+```json
+"region_id": {"type": "string", "x-labelkit-region-ref": true}
+```
+
+- **层位**：配了后处理时位于模型 Schema L2 之后、后处理之前；没配时位于 L2 之后、L2.5 之前。违规进入 L3，文本例如 `/items/0/region_id: unknown region reference`，不回显模型给的值。自洽采样中该样本弃权。
+- **注解不发给模型**：M1 解析后从发往端点的 Schema 中删除。
+- **只能用在字符串上**：值必须恰为 `true`，节点 `type` 必须是 `"string"` 或 `["string", "null"]`（`null` 值跳过检查）。写在 `integer` 上时报 `x-labelkit-region-ref must equal true on a string property or string items`。**`region_id` 字段必须声明为 string**：框架自动补的框名是字符串 `"1"`，不是整数。
+- **不能放进代码负责字段**：位于 `x-labelkit-postprocessor` 字段或其子树内是配置错误，因为这些字段不发给模型。非图片模式出现该注解也是配置错误。
+
+检查只回答「这个值是不是本样本的候选」。重复引用、是否必须全选属于业务规则，交给 `output.validator` 或后处理钩子。没有成为候选的参考框不能被引用。

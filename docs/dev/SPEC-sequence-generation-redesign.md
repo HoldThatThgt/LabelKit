@@ -6,7 +6,9 @@
 > 替换范围：一次性删除 v1.13–v1.17 的全部序列生成专用面<br>
 > 破坏边界：旧配置、内部接口、随机数消费、提示词、报表、真值和时间流工件全部删除<br>
 > 设计来源：PROPOSAL-sequence-generation-redesign.md 与 SPEC-sequence-interleaving.md，经语义、代码亲和性、
-> 示例与 E2E 三路审查修订
+> 示例与 E2E 三路审查修订<br>
+> 2026-10-31 修订（v1.22）：后校验接缝由 EventPlan 专用改为通用，载体迁到中立模块，涉及 §9.5、§16、§18、§22.1、§22.3、
+> §23.2；EventPlan 的行为零改动。另一使用方见 SPEC-image-region-segmentation.md §10.4
 
 ## 1. 交付结论
 
@@ -960,7 +962,7 @@ EventPlanRequest 或 L3。修复轮重放原始 prompt 中的 role state_instruc
 value-free pointer/keyword。StateEvaluator 随后仍从 initial state 独立重放并再次校验 outcome，StateExecutor 的
 前置修复不替代独立 gate。
 
-通过后置验证的 PostValidationResult 携带冻结 EventExecution。正式事件提交直接消费该对象，
+通过后置验证的 PostValidationResult 以 `proof` 字段携带冻结 EventExecution。正式事件提交直接消费该对象，
 不再执行 patch、Schema 或 state validator，因此不存在同一候选通过后 hook 第二次改变结果的窗口。
 在冻结 EventExecution 前，StateExecutor 还必须从对应 before/after snapshot 解析全部 payload binding state_path；
 任何叶子缺失都作为 `payload_binding` post-validator violation 进入同一次 L3，不能延迟到 FrameRenderer 后变成
@@ -1335,7 +1337,7 @@ counter delta 由 SequenceWorkflow 在同一 attempt 的局部整数表累加。
 SchemaEngine resolved-at 统计与 trace event 属于运行事实，所有 attempt 都累计，不得随事务回滚。
 
 下游只调用配置中开启的协作者；关闭的 quality、annotate、frame.annotate 或 verify 是明确的零调用。
-sequence 形态允许 `annotate.enabled = false`、`frame.annotate.enabled = true`、`segment.enabled = false`，
+sequence 形态允许 `annotate.enabled = false`、`frame.annotate.enabled = true`、`segment.enabled = false`（此处仅指开关本身），
 但仍须由开启的 pointwise quality 满足整体阶段矩阵。此时 M5 直接执行 frame pass，sequence annotation
 Schema 和 LLM 调用精确为零，`PipelineItem.annotation` 保持 null；所有应标注成员成功后 attempt 才接受。
 frame pass 已启动的并发任务必须全部收敛，再按成员声明序传播第一个错误，不得在 attempt
@@ -1814,6 +1816,8 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 ## 16. 冻结数据结构
 
 全部 dataclass frozen，字段上的 Mapping 在构造时复制为只读 MappingProxyType。生产 typedef 或 dataclass 字段必须有中文注释。
+后校验载体 PostValidationResult、PostValidatedCallRequest、ValidatedPostCall 定义在中立模块
+`labelkit/common/contracts/post_validation.py`（第 18 节），不在 `contracts/generation.py`。
 
 | 类型 | 按声明顺序冻结的字段 |
 |---|---|
@@ -1859,9 +1863,9 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | EventPlanRequest | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `state_schema`, `outcome_schema`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
 | EventExecutionContext | `program`, `plan`, `slot`, `variant_name`, `event_index`, `scenario_seed`, `current_state`, `history` |
 | StateTransitionInput | `slot_key`, `variant`, `role`, `state_before`, `state_after`, `patch` |
-| PostValidationResult | `violations`, `event_execution` |
+| PostValidationResult | `violations`, `proof` |
 | PostValidatedCallRequest | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
-| ValidatedGenerationCall | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
+| ValidatedPostCall | `object`, `proof`, `resolved_at`, `usage`, `attempts`, `model` |
 | RenderEventRequest | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index`, `utc_offset_minutes`, `limits` |
 | StateEvaluationRequest | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
 | CouplingEvaluationRequest | `variant`, `baseline_events`, `events`, `frame_classes` |
@@ -2203,13 +2207,16 @@ CONTRACTS 同时冻结：
 - DeepSeek L0-off 的纯文本 JSON 契约。
 - structured output profile 的 JSON Schema 透传。
 - FrameRenderer 的完整 Schema、按声明序精确 binding values、机械覆盖与最终完整 Schema 复验。
-- deterministic repair 与 L3 repair prompt；EventPlan 的 executable post-validator repair 重放原始
+- deterministic repair 与 L3 repair prompt；通用后校验接缝的 executable post-validator repair 重放原始
   prompt-safe 对话，再附上上一候选与受控违规，不引入新的世界状态。
 - reason code 闭集和普通日志禁止字段。
 
 schema_engine 不再认识 plan_schema、brief_schema 或 realize_schema 专名，只消费每次调用传入的标准 JSON Schema。
 
-M8 新增仅供需要可执行后置判定的内部调用面，不改变既有 complete_validated 返回类型：
+M8 提供通用后校验接缝，供需要可执行后置判定的内部调用使用，不改变既有 complete_validated 返回类型。接缝本身
+不含业务语义。载体 PostValidationResult、PostValidatedCallRequest、ValidatedPostCall 与别名 CallPostValidator
+放在中立模块 `labelkit/common/contracts/post_validation.py`，运行期不导入 `llm_client` 与 `schema_engine`，
+`contracts/generation.py` 不保留别名或再导出：
 
 ~~~python
 CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
@@ -2218,28 +2225,32 @@ class SchemaEngine:
     async def complete_post_validated(
         self,
         request: PostValidatedCallRequest,
-    ) -> ValidatedGenerationCall:
+    ) -> ValidatedPostCall:
         ...
 ~~~
 
 PostValidatedCallRequest 冻结 profile、prompt、schema、CallScope 和 CallPostValidator。M8 对每个 L2 通过的
 首轮或 L3 候选恰调用一次后置验证；EventPlan 的 callback 从该 candidate 唯一构造 EventPlan，再与闭包捕获的
-EventExecutionContext 执行，context 内不存在另一份 event_plan：
+EventExecutionContext 执行，context 内不存在另一份 event_plan，成功时以 EventExecution 作为 proof：
 
-- violations 非空且 EventExecution 为 null 是可修复结果，以 `(post-validator)` 前缀进入同一 L3 违规清单。
-- violations 为空且 EventExecution 非 null 是唯一成功结果，该 EventExecution 写入 ValidatedGenerationCall。
+- violations 非空且 proof 为 null 是可修复结果，以 `(post-validator)` 前缀进入同一 L3 违规清单。
+- violations 为空且 proof 非 null 是唯一成功结果，同一 proof 实例原样写入 ValidatedPostCall。接缝不检查 proof
+  的类型；EventPlan 的调用方 `operators/generation/scenario.py` 断言 `result.proof` 是 EventExecution，不是则 InternalError。
 - 其他形状、非 string 违规、回调异常和非 PostValidationResult 返回分别归一为
   post_validator_invalid 或 post_validator_exception，不进 L3，不携带用户数据文本。
-- EventPlan 的 L3 修复按原始 `PostValidatedCallRequest.prompt` 重放 system/user 消息，把上一候选作为 assistant
-  消息，再追加只含 `(post-validator)` violations 的 user 修复消息。重放内容只能是首轮已经看过的 prompt-safe
-  ActorView/visible state；不得追加 `EventExecution`、完整隐藏 state、hook 异常或任何新事实。普通
-  `complete_validated` 的单 user L3 prompt 保持不变。
+- L3 修复按原始 `PostValidatedCallRequest.prompt` 重放 system/user 消息（含图片与 `image_px`，不读取
+  `retain_repair_prompt`），把上一候选作为 assistant 消息，再追加只含 `(post-validator)` violations 的 user 修复消息。
+  EventPlan 的重放内容只能是首轮已经看过的 prompt-safe ActorView/visible state；不得追加 `EventExecution`、完整隐藏
+  state、hook 异常或任何新事实。普通 `complete_validated` 的单 user L3 prompt 保持不变。
+- L3 轮数为 `min(max_repair_attempts, 2)`；修复轮溢出以 SchemaViolation 结束。修复穷尽时 SchemaViolation 经只读键参
+  `usage: Usage | None = None` 携带累计用量，其他路径不写，语义不变。
 - `CallScope` 在既有 `record_ids`、`batch_no`、`record`、`user_treatment` 后新增
   `repair_context_bytes: int | None = None`。通用调用的 null 保留既有行为；v1.18 六个 family 显式传 R。
   普通 L3 按完整新 user 正文计，EventPlan 按新增 assistant raw 与新增 user 正文之和计；恰好 R 允许派发。
 
-ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 仍调用 complete_validated；只有 EventPlan 调用
-complete_post_validated。ValidatedGenerationCall.resolved_at 的闭集固定为 l0_or_clean、l1、l3_1、l3_2，
+ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 仍调用 complete_validated；生成路径中只有 EventPlan 调用
+complete_post_validated，接缝的另一使用方是 segment 图片阶段（`SPEC-image-region-segmentation.md` §10.4，以 RegionSet
+作为 proof）。ValidatedPostCall.resolved_at 的闭集固定为 l0_or_clean、l1、l3_1、l3_2，
 明确标出该成功对象的解析路径，但不写入只属于用户 Schema annotate 的全局 resolved_at 计数。M8 不保存
 跨调用后置验证器，因此并行请求不会串用 state 或 hook。
 
@@ -2534,9 +2545,14 @@ example checker 假装从不可见字段获得证明。
 - generate.stream、tiers、tier_rank、subsequence、filler、time_fields、old validator、brief 和 realize 键均拒绝。
 - 搜索证明旧生产文件、旧类型、旧 prompt、旧 report key 和旧 artifact truth 不存在。
 - tests/common/contracts/test_generation_contracts.py 用 dataclasses.fields、typing.get_type_hints、default/default_factory 与
-  frozen 检查逐个对照手写 carrier manifest；再用 inspect.signature、inspect.iscoroutinefunction 与 get_type_hints
-  对照第 17 节每个函数与方法（包括 Protocol 和 concrete class methods），以及第 18 节
-  SchemaEngine.complete_post_validated 的参数 kind、顺序、async 与返回类型，任何字段或接口漂移必须失败。
+  frozen 检查逐个对照手写 carrier manifest（后校验载体从 `labelkit/common/contracts/post_validation.py` 读取）；再用
+  inspect.signature、inspect.iscoroutinefunction 与 get_type_hints 对照第 17 节每个函数与方法（包括 Protocol 和 concrete
+  class methods），以及第 18 节 SchemaEngine.complete_post_validated 的参数 kind、顺序、async 与返回类型
+  （ValidatedPostCall），任何字段或接口漂移必须失败。
+- 通用后校验接缝：成功形状为「违规为空且 proof 非空」；同一 proof 实例返回；修复重放首轮 prompt；修复轮溢出以
+  SchemaViolation 结束且写 usage；校验函数异常收敛为终态；post_validation 模块没有运行期 inference 导入；EventPlan 的
+  proof 不是 EventExecution 时在 scenario 层以 InternalError 失败，`PostValidationResult((), object())` 的旧用例移到该层。
+  用例见 `SPEC-image-region-segmentation.md` §19.8 AC-127。
 
 ### 22.2 planner 与 pattern
 
@@ -2598,7 +2614,7 @@ example checker 假装从不可见字段获得证明。
   generation_downstream_contract 终止，证明 prompt 与后置执行不存在两份事件真值。
 - instruction-only ScenarioSeed 的 actor 名为空时在 ScenarioSeed Schema 边界拒绝；内部 forged carrier 也必须在首个
   EventPlan 前终态拒绝。8-event 上限高层测试必须完整结束，且扁平 history/ActorView 不允许递归增长。
-- complete_post_validated 返回的 EventExecution 与正式提交消费的是同一冻结实例；patch、Schema 与 state validator
+- complete_post_validated 以 proof 返回的 EventExecution 与正式提交消费的是同一冻结实例；patch、Schema 与 state validator
   对成功候选各执行恰一次，不允许丢弃 proof 后重放。
 - StateEvaluator 还必须独立复验操作闭集、test 前缀、read/write 权限、pre-state Schema、每步 base
   state Schema、state hook、before/after hash 与 payload binding。测试使用最终状态不变的越权 no-op
@@ -2720,7 +2736,7 @@ instruction-only 使用真实 DeepSeek 另跑一个非空 slot，必须断言：
 - report.llm_usage 各 profile 的 calls 合计大于等于 `2 * estimate.successful_attempt_lower_bound`。
 
 另一个真实用例在 EventPlan 的 production state 后置验证边界装饰一次性 violation，触发 M8 L3 repair 后放行；
-精确断言装饰函数只注入一次、目标调用的 ValidatedGenerationCall.resolved_at 匹配 `l3_[12]`，且最终提交的 EventExecution
+精确断言装饰函数只注入一次、目标调用的 ValidatedPostCall.resolved_at 匹配 `l3_[12]`，且最终提交的 EventExecution
 与最后一次成功后置验证返回的冻结对象身份相同。不与另一场无注入 live run 比较，避免模型非确定性污染证据。
 该用例证明 DeepSeek supports_structured_output = false 路径的
 文本 JSON、确定性解析和真实修复环，不用模型偶发违约充当注入。

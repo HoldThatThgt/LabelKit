@@ -1942,7 +1942,7 @@ prompt = ""
 
 # ── v1.8: [stream]/[segment]/[extract] parsing + defaults ───────────────────
 
-SEG_ON = "[segment]\nenabled = true\n"
+SEG_ON = "[segment]\nenabled = true\nmode = \"sequence\"\n"
 
 
 def test_stream_sections_default_when_absent(env):
@@ -1985,6 +1985,7 @@ session_max_span_s = 3600
 
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "llm"
 llm = "judge"
 window = 8

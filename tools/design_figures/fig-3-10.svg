@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 450"
+     font-family="PingFang SC, Microsoft YaHei, sans-serif" role="img" aria-labelledby="segment-image-title">
+  <title id="segment-image-title">segment 图片模式数据流</title>
+  <desc>ingest 摄取图片与可选伴随文件；segment 把伴随数据转成参考框，再由模型生成候选或让参考框直接成为候选；
+    候选挂在信封上，dedup、classify、quality 之后由 annotate、后处理、verify 读取同一份，最后写入 _meta.regions。
+    叠图由候选惰性渲染，随 annotate 与 verify 的请求发送，不落盘。</desc>
+  <defs>
+    <marker id="segment-image-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#526477"/>
+    </marker>
+    <marker id="segment-image-arrow-new" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2e7d32"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#526477" stroke-width="2" marker-end="url(#segment-image-arrow)">
+    <path d="M 210 85 H 237"/>
+    <path d="M 510 85 H 537"/>
+    <path d="M 690 85 H 717"/>
+    <path d="M 850 85 H 877"/>
+    <path d="M 965 130 V 165 H 200 V 197"/>
+    <path d="M 340 250 H 407"/>
+    <path d="M 570 250 H 607"/>
+    <path d="M 800 250 H 837"/>
+  </g>
+  <g fill="none" stroke="#2e7d32" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#segment-image-arrow-new)">
+    <path d="M 260 130 V 150 H 15 V 390 H 127"/>
+    <path d="M 200 350 V 303"/>
+    <path d="M 705 350 V 303"/>
+  </g>
+  <g stroke="#526477" fill="#edf3fa">
+    <rect x="30" y="40" width="180" height="90" rx="9"/>
+    <rect x="540" y="40" width="150" height="90" rx="9"/>
+    <rect x="720" y="40" width="130" height="90" rx="9"/>
+    <rect x="880" y="40" width="170" height="90" rx="9"/>
+    <rect x="60" y="200" width="280" height="100" rx="9"/>
+    <rect x="410" y="200" width="160" height="100" rx="9"/>
+    <rect x="610" y="200" width="190" height="100" rx="9"/>
+    <rect x="840" y="200" width="210" height="100" rx="9"/>
+  </g>
+  <g stroke="#2e7d32" fill="#e8f5e9">
+    <rect x="240" y="40" width="270" height="90" rx="9"/>
+    <rect x="130" y="350" width="620" height="80" rx="9" stroke-dasharray="7 5"/>
+  </g>
+  <g text-anchor="middle" fill="#26384b" font-size="15">
+    <text x="120" y="68" font-weight="700" font-size="16">ingest</text>
+    <text x="120" y="92">图片必需</text>
+    <text x="120" y="114">伴随文件可选</text>
+
+    <text x="375" y="68" font-weight="700" font-size="16">segment（mode = image）</text>
+    <text x="375" y="92">box_parser 转参考框</text>
+    <text x="375" y="114">模型生成或参考框直通</text>
+
+    <text x="615" y="76" font-weight="700" font-size="16">dedup</text>
+    <text x="615" y="102">精确层含图片摘要</text>
+
+    <text x="785" y="76" font-weight="700" font-size="16">classify</text>
+    <text x="785" y="102">只看原图</text>
+
+    <text x="965" y="76" font-weight="700" font-size="16">quality</text>
+    <text x="965" y="102">只看原图</text>
+
+    <text x="200" y="228" font-weight="700" font-size="16">annotate</text>
+    <text x="200" y="254">原图、叠图、参考框、候选</text>
+    <text x="200" y="278">引用检查（可修复）</text>
+
+    <text x="490" y="240" font-weight="700" font-size="16">后处理</text>
+    <text x="490" y="266">样本上下文</text>
+
+    <text x="705" y="240" font-weight="700" font-size="16">verify</text>
+    <text x="705" y="266">同一候选，不重新分割</text>
+
+    <text x="945" y="240" font-weight="700" font-size="16">emitter</text>
+    <text x="945" y="266">_meta.regions</text>
+
+    <text x="440" y="382" font-weight="700" font-size="16">RegionOverlayRef</text>
+    <text x="440" y="408">按请求尺寸惰性渲染，与原图同一逐轴缩放；字节用完即弃，不落盘</text>
+  </g>
+</svg>

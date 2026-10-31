@@ -60,7 +60,7 @@ def _request_transition(context):
         {"op": "test", "path": "/request/status", "value": "new"},
         {"op": "replace", "path": "/request/status", "value": "pending"},
     ))
-    return post_validate_event_plan(candidate, context).event_execution
+    return post_validate_event_plan(candidate, context).proof
 
 
 def _ack_context(program, plan):
@@ -94,7 +94,7 @@ def _confirm_context(program, plan):
             {"op": "replace", "path": "/request/status", "value": "acknowledged"},
         ),
     }
-    execution = post_validate_event_plan(candidate, context).event_execution
+    execution = post_validate_event_plan(candidate, context).proof
     planned = resolve_planned_events(context)[1]
     draft = EventDraft(
         planned.event_key, "second-event", "acknowledgement", "system",
@@ -143,9 +143,9 @@ def test_event_patch_executes_once_and_produces_authoritative_bindings(declared_
     ))
     result = post_validate_event_plan(candidate, context)
     assert result.violations == ()
-    assert result.event_execution.state_before["request"]["status"] == "new"
-    assert result.event_execution.state_after["request"]["status"] == "pending"
-    values = binding_values(resolve_role(context), result.event_execution)
+    assert result.proof.state_before["request"]["status"] == "new"
+    assert result.proof.state_after["request"]["status"] == "pending"
+    values = binding_values(resolve_role(context), result.proof)
     assert values == {"/request_id": "R-100", "/status": "pending"}
 
 
@@ -206,7 +206,7 @@ def test_missing_binding_leaf_is_a_repairable_post_validation_violation(declared
     )
     result = post_validate_event_plan(_request_candidate(patch), context)
     assert result.violations == ("payload_binding",)
-    assert result.event_execution is None
+    assert result.proof is None
 
 
 def test_token_prefix_permission_rejects_hidden_and_sibling_paths(declared_program):
@@ -219,7 +219,7 @@ def test_token_prefix_permission_rejects_hidden_and_sibling_paths(declared_progr
         ))
         result = post_validate_event_plan(candidate, context)
         assert result.violations == ("patch_permission",)
-        assert result.event_execution is None
+        assert result.proof is None
         assert context.current_state["hidden_sentinel"] == "catalog-secret-a"
 
 
@@ -237,7 +237,7 @@ def test_state_hook_violations_are_preserved_verbatim(declared_program):
     ))
     result = post_validate_event_plan(candidate, context)
     assert result.violations == ("first violation", "second violation")
-    assert result.event_execution is None
+    assert result.proof is None
 
 
 def test_rfc6902_test_add_replace_remove_succeeds_atomically(declared_program):
@@ -256,8 +256,8 @@ def test_rfc6902_test_add_replace_remove_succeeds_atomically(declared_program):
     }
     result = post_validate_event_plan(candidate, context)
     assert result.violations == ()
-    assert result.event_execution.state_after["request"]["acknowledged"] is True
-    assert result.event_execution.state_after["request"]["status"] == "acknowledged"
+    assert result.proof.state_after["request"]["acknowledged"] is True
+    assert result.proof.state_after["request"]["status"] == "acknowledged"
     view = build_actor_view(context)
     assert view.observations[0]["source_event_key"] == context.history[0].event_key
     assert view.observations[0]["values"] == context.history[0].publish_snapshot
@@ -286,7 +286,7 @@ def test_move_copy_test_order_and_failed_test_are_rejected_without_mutation(decl
     for patch, expected in candidates:
         result = post_validate_event_plan(_request_candidate(patch), context)
         assert result.violations == (expected,)
-        assert result.event_execution is None
+        assert result.proof is None
         assert canonical_json(context.current_state) == before
 
 
@@ -300,7 +300,7 @@ def test_multiple_prefix_tests_are_allowed_before_first_mutation(declared_progra
     )
     result = post_validate_event_plan(_request_candidate(patch), context)
     assert result.violations == ()
-    assert result.event_execution.state_after["request"]["status"] == "pending"
+    assert result.proof.state_after["request"]["status"] == "pending"
 
 
 def test_patch_without_test_is_rejected_with_stable_violation(declared_program):
@@ -311,7 +311,7 @@ def test_patch_without_test_is_rejected_with_stable_violation(declared_program):
         {"op": "replace", "path": "/request/status", "value": "pending"},
     )), context)
     assert result.violations == ("patch_test_prefix",)
-    assert result.event_execution is None
+    assert result.proof is None
 
 
 @pytest.mark.parametrize(("invalid_hook", "error", "message"), (

@@ -4,6 +4,7 @@
 > 日期：2026-09-05
 > 实施基线：`9f88620`
 > 范围：普通记录、序列记录和成员帧的标注结果；包含所有标注重试、verify 修复与序列交付路径
+> 2026-10-31 修订（v1.22）：§3.2 增图片样本的框架样本上下文，§5.2 增区域引用错误的可修复路径，§7 增图片验收行；非图片模式行为零改动。状态行与 §9 的证据只覆盖 2026-09-05 的交付；图片模式的权威定义见 [SPEC-image-region-segmentation.md](SPEC-image-region-segmentation.md) §13
 
 ## 1. 产品行为
 
@@ -89,6 +90,23 @@ def complete_annotation(obj: dict, record: dict | None) -> dict:
 `obj` 是已通过模型 Schema 的独立深拷贝。普通记录与成员帧的 `record` 是 `Record.raw` 的独立深拷贝，
 缺失时为 `None`。序列记录恒传 `None`，不把内部 generation truth 当成原始业务记录暴露给工程函数。
 框架不虚构 `text`、`label` 或其他原始行字段。函数可以返回修改后的 `obj`，也可以返回另一个完整字典。
+
+图片模式（`segment.mode = "image"`）例外：图片样本的 `record` 是框架绑定的样本上下文，不是原始行，因此不违反
+「不虚构原始行字段」。上下文只含框架事实，键序与形状冻结在 `SPEC-image-region-segmentation.md` §13.1：
+
+| 键 | 内容 |
+|---|---|
+| `sample_id` | 记录 id，与 `_meta.id` 同值 |
+| `source` | `{"file", "pair_index"}`，`file` 相对 `run.input` |
+| `image` | `{"width", "height"}`，原图存储像素 |
+| `boxes` | `RegionSet.boxes` 的 JSON 投影，每项恒为 `{"id", "bbox", "text"}`，`id` 恒为非空字符串 |
+| `regions` | 候选列表，每项为 `{"region_id", "geometry", "box_id", "source_box_ids"}`，几何为原图像素，与 `_meta.regions.items[]` 逐元素同形 |
+
+`annotation_record_context(record, regions)` 在 `regions` 非 `None` 时返回该上下文；后处理函数与 `output.validator`
+的入参由同一次调用的结果构造，每次都是新的深拷贝。文本、成员帧与序列记录维持上一段的原值，函数签名不变，
+`passthrough_fields` 仍读 `Record.raw`。上下文只提供路径字符串，不提供文件句柄或像素数据。启动探针与 few-shot 干跑仍以
+`None` 调用 `output.validator`，图片模式的校验器与钩子必须处理 `record is None`；few-shot 输出里的 region_id
+只做 Schema 检查，不做引用检查。
 
 返回值必须是仅包含标准 JSON 值的字典：字符串键、对象、数组、字符串、有限数值、布尔值和 null。
 `None`、标量、tuple、set、任意对象、非字符串键、NaN、Infinity 和循环引用均是契约错误。
@@ -194,6 +212,7 @@ verify 必须评审含代码字段的完整最终标注；重新标注时的模�
 | 情况 | 处理 |
 |---|---|
 | 模型 JSON 或模型 Schema 违规 | 既有 L1/L3 修复；不调用尚未合格候选的后处理函数 |
+| 图片模式下 `x-labelkit-region-ref` 字段引用未知区域 | 可修复违规 `<concrete-pointer>: unknown region reference`，不回显模型给出的值，进入既有 L3；不调用尚未合格候选的后处理函数；自洽采样中该样本弃权 |
 | 完整终验后的用户 validator 返回违规 | 既有 L3 修复预算，每次对新的模型候选重新处理 |
 | 函数异常、非法返回值、非法 JSON | 固定脱敏 `PostprocessorError`，属于 `InternalError`，不进入模型修复 |
 | 函数自行产生框架时间或最终 Schema 不合格 | 定稿契约错误，沿既有 internal error 路径处理，不进入模型修复 |
@@ -203,6 +222,13 @@ verify 必须评审含代码字段的完整最终标注；重新标注时的模�
 stream verify 的 episode repair 和 frame backfill 不能把上述 sequence 内部错误吞成可恢复记录失败。
 失败对象不得进入正式 annotation，后处理副本及其修改全部丢弃。错误日志为英文，仅含固定原因、钩子位置
 及允许的记录标识，不包含候选、原始记录、函数异常正文或凭据。
+
+区域引用的可修复路径（提案裁决 D6）：引用检查位于后处理之前，`complete_finalized` 中在模型 Schema L2 之后、finalizer
+之前，`complete_validated`（未配后处理）中在 L2 之后、L2.5 之前。一次模型笔误因此进入 L3 修复，而不是让记录直接终局失败。
+后处理函数对未知 region_id 抛错仍是上表的程序错误，不进入模型修复，不作为引用检查手段。可检查的 id 集合
+`CallScope.region_ids` 由框架从同一 `RegionSet` 派生，不从用户可见的上下文 JSON 反解析；`null` 值与缺失的可选字段跳过。
+重复引用、是否必须全选等语义属于业务规则，交给用户的校验器或后处理函数。注解 `x-labelkit-region-ref` 从模型 Schema 与
+L2 所用 Schema 中删除，完整 Schema 保留；它位于代码负责字段或其子树内是配置错误（rule 81b）。
 
 ### 5.3 隔离、冻结与序列一致性
 
@@ -368,6 +394,11 @@ Schema 投影发现不支持的带标记结构时抛固定定位的 ValueError�
 | 最终交付 | 处理后的 main/member/primary/replay 一致，retained bytes、摘要与 manifest hash 独立复算通过 |
 | 关闭行为与预算 | 未启用处理时结果和调用数保持；模型提示词、实际 response Schema 与预算使用同一投影 |
 | 本地真实模型 | 真实 4B 推理产生语义字段，代码计算实体位置/派生值，独立检查最终工件 |
+| 图片样本上下文 | 图片样本的后处理函数与 `output.validator` 收到同值的框架样本上下文，键序冻结，每次新深拷贝；文本、成员帧、序列维持原值；探针与 few-shot 以 `None` 调用 validator；`passthrough_fields` 仍读 `Record.raw` |
+| 图片区域引用 | 未知引用在 finalizer 与 L2.5 之前进入 L3，违规不回显模型给出的值；注解不上行；`null` 跳过；数组路径报告具体 Pointer；few-shot 不做引用检查；自洽样本弃权 |
+
+图片两行映射到 `SPEC-image-region-segmentation.md` §19.8 的 AC-134、AC-135 登记的测试节点，并在该规格下验收；
+§9 保留 2026-09-05 的实跑证据，不含这两行。
 
 ## 8. 验证门与完成条件
 

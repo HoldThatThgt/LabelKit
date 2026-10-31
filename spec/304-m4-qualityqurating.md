@@ -67,6 +67,15 @@ top_ratio 或任何组内相互影响的 selection 都在 M1 拒绝。`run_attem
 入口原样穿透；retryable exhaustion、Schema/context/truncation 与普通质量拒绝返回
 `DownstreamAttemptResult(accepted=false)`，消耗当前 slot attempt。
 
+**图片模式无树变体（v1.22）。**图片模式恒不构造 `UITree`，分支判据是 `record.ui_tree is None`（非图片 UI 记录恒有树，所以非图片字节不变）。quality 不接收候选和叠图；`quality._ui_parts` 的 fit 只计标签文本，其余 system 文本不变。CONTRACTS §10.2、§10.3 新增：
+
+| 形态 | 无树变体（UI 模态） |
+|---|---|
+| pairwise | text part `[记录 A 图片]`，image part，text part `[记录 B 图片]`，image part |
+| pointwise | text part `[记录内容 图片]`，image part |
+
+图片模式没有默认 rubric：`default:ui` 权重 1.5 的 `tree_screen_consistency` 对无树样本恒无意义，所以 `quality.enabled = true` 而 `quality.rubric` 为空是 CONFIG_ERROR（rule 80，D10）；图片工程要么显式指定 rubric，要么写 `quality.enabled = false`。
+
 ### 3.4.5 API 与配置
 
 ```

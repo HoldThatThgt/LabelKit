@@ -75,7 +75,7 @@ Schema 修复仍需要知道你原来要标注什么。process 记录标注会�
 ### 帧级标注：序列行内的逐成员第二层
 
 `[frame.annotate]` 复用 annotate 算子的成员 pass，每个成员一次调用，提示词仍是 `[任务]` + 帧 Schema
-全文 + 当前成员帧。它有两个明确入口：process 流模式要求 `segment.enabled=true`，并在 episode 的序列标注
+全文 + 当前成员帧。它有两个明确入口：process 流模式要求 `segment.enabled=true` 且 `segment.mode="sequence"`，并在 episode 的序列标注
 成功后运行；sequence generation 已有冻结成员和 inherited frame class，可脱离 segment，并可在
 `annotate.enabled=false` 时直接运行。frame-only sequence 不构造序列标注 prompt，序列标注调用精确为零。
 
@@ -114,6 +114,28 @@ schema_path = "schemas/frame-annotation.json"
 不需要添加 `[segment]`。可运行工程见 `examples/sequence-generation/project-frame-only.toml`；checker 同时验证
 main 的 sequence annotation 为 null、结构引擎的 sequence resolved-at 总数为零，以及 main/stream 两个视图中
 每个 frame annotation 都通过同一帧 Schema。
+
+### 图片模式：原图、叠图、参考框与候选（v1.22）
+
+`segment.mode = "image"` 时，system 消息与 few-shot 都不变，当前记录的消息换成下面的冻结形态（第 28 章）：
+
+```
+user (当前记录，图片模式):
+  [原图] <image>
+  [候选区域叠图] <image: 按同一缩放比例渲染的半透明叠图>
+  [参考框]                                      ← 有参考框且写了 segment.instruction 时
+  {"box_id": "n1", "bbox": [111, 312, 889, 396], "text": "Button Sign in"}
+  [候选区域]
+  [{"region_id": "n1", "polygons": [{"exterior": [[111, 312], ...], "holes": []}], "box_id": "n1", "source_box_ids": ["n1"], "text": "Button Sign in"}]
+  原图与候选区域叠图来自同一样本；……候选与参考框坐标为 0–1000 网格，画布为 540×960 像素。
+```
+
+示例中的网格值由 `project-boxes.toml` 的参考框实跑渲染得到，`n1` 的像素框是 `[60, 300, 480, 380]`，画布 540 × 960。该工程只用参考框，所以它的实际请求省略 `[参考框]` 块：每个候选本身就是一个参考框。
+
+- **模型不生成几何**，只按 `region_id` 引用候选。候选来自 segment，换一套 annotate 指令不会改变候选；不要求全部选中，也不新增分类、筛选、合并或遮挡规则。没有成为候选的参考框不能被引用。
+- **候选块与参考框块从不裁剪**。图片模式没有控件树，所以 `input.ui_tree_max_chars` 不适用（显式书写是配置错误）。放不下就在首轮预检以 `context_overflow` 明确失败，任何情况下都不静默删减候选、原图或叠图。修复轮超预算沿用现行归因，以 `schema_violation` 失败，仍是明确失败。
+- **请求带两张图**，按 `n_images × image_cost` 计费。所有被引用 profile 都必须声明正的 `context_window`。
+- **修复轮**继续携带同一份候选和图片。segment 产出的是同一份冻结候选，自洽采样、修复和 verify 返工都不会重新分割。
 
 ## 11.3 配置参考
 
@@ -182,6 +204,8 @@ instruction = """
 
 **何时值得开**：输出以**分类字段为主**（枚举/布尔）、且下游对标签错误敏感时，n=3 的收益最明显（Self-Consistency 论文的多路径投票机制）；输出以自由文本为主时收益很小——投票机制对文本字段基本是摆设。**成本直白：调用与 token ×n。**先用单次标注把 instruction 调到位，最后才用 self-consistency 兜稳定性——它救不了写得含糊的指令。
 
+**图片模式下没有区域选择的一致性信号。**投票只覆盖顶层枚举、布尔、整数字段，`items[].region_id` 这类数组不参与投票，`agreement_ratio` 也不反映区域选择是否一致。某个样本引用未知 region_id 且修复穷尽时，该样本弃权，由其余样本投票（修复轮超预算同样弃权）。
+
 ## 11.6 失败与去向
 
 - 结构修复预算耗尽 ⇒ 记录 `failed` 进拒绝通道（错误码 `schema_violation`；注册了 `output.validator` 回调且剩余违规全部来自回调时为 `callback_violation`，见 14.5）——**永远不会有非法结构或违反你业务规则的对象混进主输出**；
@@ -241,3 +265,43 @@ flowchart LR
 
 可运行的车牌实体位置与序列派生字段工程见
 [annotation-postprocessing 示例](../../examples/annotation-postprocessing/README.md)。
+
+## 11.9 图片模式的后处理：样本上下文（v1.22）
+
+图片样本没有原始行，所以 `segment.mode = "image"` 时后处理函数与 `output.validator` 的第二入参不再是 `None`，而是框架绑定的样本上下文。函数签名不变，每次拿到的都是新的深拷贝：
+
+```json
+{
+  "sample_id": "8f3c2a91d0b47e65",
+  "source": {"file": "image_7.png", "pair_index": 7},
+  "image": {"width": 1080, "height": 2340},
+  "boxes": [
+    {"id": "n12", "bbox": [43, 140, 821, 1264], "text": "Button 登录"}
+  ],
+  "regions": [
+    {"region_id": "n12",
+     "geometry": {"type": "Polygon",
+                  "coordinates": [[[43, 140], [821, 140], [821, 1264], [43, 1264], [43, 140]]]},
+     "box_id": "n12",
+     "source_box_ids": ["n12"]}
+  ]
+}
+```
+
+`sample_id` 与 `_meta.id` 同值，`source.file` 相对 `run.input`，`regions[]` 与 `_meta.regions.items[]` 逐元素同形，坐标是原图像素。上下文只给路径字符串，不给文件句柄或像素，钩子不需要也不应打开图片。
+
+```python
+def keep_polygons(candidate: dict, context: dict | None) -> dict:
+    if context is None:                 # 启动探针路径没有样本
+        return candidate
+    geometry = {region["region_id"]: region["geometry"] for region in context["regions"]}
+    return {"items": [{**item, "geometry": geometry[item["region_id"]]} for item in candidate["items"]]}
+```
+
+这段取自 `examples/image-segmentation/hooks.py`，同一文件还有转外接矩形的 `to_bounding_boxes`。Schema 里把 `geometry` 标 `x-labelkit-postprocessor: true`，模型就看不到它。
+
+三条容易踩的规则：
+
+- **必须处理 `record is None`。**启动探针与 few-shot 干跑仍以 `None` 调用 `output.validator`。few-shot 输出里的 `region_id` 只做 Schema 检查，不做引用检查，因为启动时还没有样本。
+- **返回值必须是 JSON 列表，不能是元组。**`bbox` 写成 `(l, t, r, b)` 属于程序错误，记录以 `internal_error` 失败，不进模型修复。
+- **未知 region_id 不要靠后处理抛错来拦。**后处理异常是终局的程序错误。给字段标 `x-labelkit-region-ref: true`（第 14 章 14.9），引用检查在后处理之前运行，违规可修复。重复引用、是否必须全选属于业务规则，写在 `output.validator` 或钩子里。

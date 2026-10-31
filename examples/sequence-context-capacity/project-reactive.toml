@@ -13,6 +13,7 @@ gap_s = 900
 session_max_len = 64
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "rules"
 window = 32
 min_len = 2

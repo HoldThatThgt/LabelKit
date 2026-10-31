@@ -98,7 +98,7 @@ class _Project:
     input: InputConfig                   # [input] 摄取参数
     stream: StreamConfig                 # [stream] 时间序与会话切分声明
     dedup: DedupConfig                   # [dedup] 去重参数
-    segment: SegmentConfig               # [segment] 流分段(vision_resolved 待冻结)
+    segment: SegmentConfig               # [segment] 分割(vision_resolved/resolved_box_parser 待冻结)
     stitch: StitchConfig                 # [stitch] 线索缝合
     extract: ExtractConfig               # [extract] 动作摘取
     classify: ClassifyConfig             # [classify] 序列级闭集分类
@@ -109,7 +109,7 @@ class _Project:
     frame_class_raw: Any                 # [frame.class.<name>.*] 原始节
     frame_provided: dict[str, bool]      # [frame] 命名空间的显式书写探针
     stream_provided: dict[str, bool]     # [stream] 的在场/显式书写探针
-    segment_provided: dict[str, bool]    # [segment] 的在场/显式书写探针(含 use_vision)
+    segment_provided: dict[str, bool]    # [segment] 的在场/逐键显式书写探针(含 use_vision)
     stitch_provided: dict[str, bool]     # [stitch] 的在场探针
     extract_provided: dict[str, bool]    # [extract] 的在场探针
     quality: QualityConfig               # [quality] 质量打分
@@ -122,6 +122,7 @@ class _Project:
     trace: TraceConfig                   # [trace] 追踪通道
     rubric_raw: Any                      # [rubric] 原始节(按 3.1.4 次序延迟解析)
     raw_project: dict[str, Any]          # v1.18 sequence 解析器读取的原始项目树
+    input_provided: dict[str, bool]      # [input] 的显式书写探针(ui_tree_max_chars)
 
 
 # ── config.toml 一侧 ────────────────────────────────────────────────────────
@@ -710,7 +711,8 @@ def _parse_dedup(col: _Collector, file: str, top: _Tbl) -> DedupConfig:
 
 
 def _parse_segment(col: _Collector, file: str, section: Any) -> SegmentConfig:
-    """解析 ``[segment]`` 节(流分段; ``vision_resolved`` 是 load() 收尾冻结的解析产物)。
+    """解析 ``[segment]`` 节(``sequence_resolved`` 在此冻结; ``vision_resolved`` 与
+    ``resolved_box_parser`` 由约束簇冻结)。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
@@ -718,8 +720,10 @@ def _parse_segment(col: _Collector, file: str, section: Any) -> SegmentConfig:
     @return ``SegmentConfig``
     """
     t = _Tbl(col, file, "[segment]", section)
+    enabled = t.get_bool("enabled", False)
+    mode = t.get_str("mode", None, enum=("image", "sequence"))
     cfg = SegmentConfig(
-        enabled=t.get_bool("enabled", False),
+        enabled=enabled,
         strategy=t.get_str("strategy", "hybrid", enum=("rules", "llm", "hybrid")),
         llm=t.get_str("llm", "default", nonempty=True),
         window=t.get_int("window", 20, minimum=1),   # >= 2 在约束簇里查(§3.6)
@@ -727,6 +731,11 @@ def _parse_segment(col: _Collector, file: str, section: Any) -> SegmentConfig:
         min_len=t.get_int("min_len", 2, minimum=1),
         context=t.get_str("context", "") or "",
         on_error=t.get_str("on_error", "keep", enum=("keep", "fail")),
+        mode=mode,
+        instruction=t.get_str("instruction", "") or "",
+        box_parser=t.get_str("box_parser", None, nonempty=True),
+        companion_suffix=t.get_str("companion_suffix", None),
+        sequence_resolved=enabled and mode == "sequence",
     )
     # v1.11 (V2/V27②): `use_vision` 已移除——它的显式在场是**定向** CONFIG_ERROR,
     # 由约束簇经原始节探针上报, 而非未知键前向兼容 WARN(此处标记 seen 抑制该 WARN,
@@ -1071,6 +1080,11 @@ def _parse_frame_ns(col: _Collector, file: str, top: _Tbl) -> tuple[
     return frame_classify, frame_annotate, frame_class_raw, provided
 
 
+# v1.22 需要显式书写探针的 [segment] 键(CONTRACTS §6.3 键的模式合法性表)。
+_SEGMENT_MODE_KEYS = ("mode", "llm", "instruction", "box_parser", "companion_suffix",
+                      "strategy", "window", "noise_filter", "min_len", "context", "on_error")
+
+
 def _stream_family_probes(stream_section: Any, segment_section: Any,
                           stitch_section: Any,
                           extract_section: Any) -> dict[str, dict[str, bool]]:
@@ -1096,6 +1110,9 @@ def _stream_family_probes(stream_section: Any, segment_section: Any,
             # v1.11 (V2/V27②) 原始节探针: 已移除键的在场, 独立于未知键路径。
             "use_vision": (isinstance(segment_section, dict)
                            and "use_vision" in segment_section),
+            # v1.22: 键的模式合法性只看是否显式书写, 不看解析后的取值。
+            **{key: isinstance(segment_section, dict) and key in segment_section
+               for key in _SEGMENT_MODE_KEYS},
         },
         "stitch": {
             "non_switch_keys": (isinstance(stitch_section, dict)
@@ -1252,6 +1269,9 @@ def _parse_project_file(col: _Collector, file: str, data: dict,
     parts.update(_parse_labeling_family(col, file, top))
     parts.update(_parse_delivery_family(col, file, top))
     parts["raw_project"] = data
+    input_section = data.get("input")
+    parts["input_provided"] = {"ui_tree_max_chars": (isinstance(input_section, dict)
+                                                     and "ui_tree_max_chars" in input_section)}
     top.finish()
     parts["output"] = replace(parts["output"],
                               schema_path=_resolve_project_path(

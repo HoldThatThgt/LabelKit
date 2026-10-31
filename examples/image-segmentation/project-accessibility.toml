@@ -1,0 +1,56 @@
+# 截图加无障碍树 JSON：换一个钩子就换一种伴随格式，LabelKit 不判断数据是不是控件树。
+# classify 走图片模式的无树提示词，不读候选。
+schema_version = 1
+
+[run]
+input = "./data/screens-json"
+output = "./out/accessibility.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[segment]
+enabled = true
+mode = "image"
+llm = "default"
+box_parser = "hooks.py:accessibility_to_boxes"
+companion_suffix = ".json"
+instruction = """
+结合图片和参考框生成候选区域。参考框准确时直接复用。
+"""
+
+[classify]
+enabled = true
+llm = "default"
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "account"
+description = "登录、注册等账号相关屏幕"
+
+[[classify.classes]]
+name = "other"
+description = "其他屏幕"
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:keep_polygons"
+instruction = """
+判断每个候选控件的功能。通过 region_id 引用候选，label 写功能名称。
+"""
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-polygons.json"
+meta_mode = "inline"
+rejects = "refs"

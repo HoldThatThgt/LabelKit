@@ -182,7 +182,7 @@ process session 的 Schema 调用使用 `CallScope.complete_evidence=true`：L3 
 
 | 键 | 类型 / 默认 | 说明与约束 |
 |---|---|---|
-| `enabled` | bool / `false` | 总开关；true ⇒ `segment.enabled = true`（M1 约束，3.1.4）。false = 不入链、主输出/rejects/report.json 与 v1.8 逐字节等价（3.16.4 退化锚行）。`[stitch]` 有 payload 而本键 false ⇒ M1 no-op warning（3.1.4）。 |
+| `enabled` | bool / `false` | 总开关；true ⇒ `segment.sequence_resolved = true`（M1 约束，3.1.4；`segment.mode = "image"` 时开启是定向 CONFIG_ERROR，rule 76）。false = 不入链、主输出/rejects/report.json 与 v1.8 逐字节等价（3.16.4 退化锚行）。`[stitch]` 有 payload 而本键 false ⇒ M1 no-op warning（3.1.4）。 |
 | `llm` | str / `"default"` | 判定 profile 引用；启用时计入密钥解析 / `--probe` / 存在性引用集，**不入 vision 校验集**（纯文本证据，无视觉必需，3.1.4）。 |
 | `max_open` | int / `4` | 开放线索池容量。锚点：真实桌面日志的挂起窗口均值 3（S.D.≈2）+ 1 条活跃 [81]；移动域穿插深度更浅（仅 22.6% 任务存在穿插 [90]），4 为宽松上界。 |
 | `bias` | `"conservative"`\|`"llm"` / `"conservative"` | 判定偏置：默认 LLM × 机械先验合取（3.16.4 保守偏置行）；`"llm"` = 纯 LLM 判（审计/消融用）。 |

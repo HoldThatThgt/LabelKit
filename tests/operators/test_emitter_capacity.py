@@ -23,7 +23,7 @@ def test_repeated_content_occurrences_keep_distinct_frame_products_in_output(tmp
         2: Annotation({"intent": "first", "entities": []}, "local", 1, Usage()),
         8: Annotation({"intent": "second", "entities": []}, "local", 1, Usage()),
     }
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True), frame_classify=frame_classify_cfg(),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True), frame_classify=frame_classify_cfg(),
                    frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
     _, result = run_emitter(cfg, [item])
     assert result.emitted == 1
@@ -44,7 +44,7 @@ def test_capacity_cut_output_has_exact_position_bounds_and_lineage(tmp_path, sea
     after = CapacityCut(8, 9, "quality", "judge", "precheck")
     item.member_positions = (4,)
     item.capacity = SequenceCapacity(SequenceBounds(2, 9, before, after), sealed, "root", "direct-parent")
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     run_emitter(cfg, [item])
     capacity = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]["capacity"]
     assert list(capacity) == ["sealed", "allowed_positions", "before", "after", "root_id", "parent_id"]

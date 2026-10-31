@@ -133,7 +133,7 @@ def make_cfg() -> ResolvedConfig:
         input=InputConfig(),
         stream=StreamConfig(),
         dedup=DedupConfig(),
-        segment=SegmentConfig(enabled=True, strategy="hybrid", llm="default",
+        segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid", llm="default",
                               window=8, min_len=2, context=SEGMENT_CONTEXT,
                               # v1.11 (V1): parse product M1 derives for this
                               # exact cfg (ui modality + hybrid + the profile's

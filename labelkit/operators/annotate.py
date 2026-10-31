@@ -24,6 +24,9 @@ from labelkit.common.contracts.sequence_capacity import (
 from labelkit.common.contracts.generation import (
     DownstreamAttemptRequest, DownstreamAttemptResult, SequenceTemporalContext,
 )
+from labelkit.common.contracts.regions import (
+    RegionOverlayRef, RegionSet, render_candidates, render_material_note, render_reference_boxes,
+)
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -52,6 +55,7 @@ from labelkit.operators.annotation_finalization import (
     class_annotate_schema,
     class_effective_model_schema,
     class_effective_schema,
+    class_region_ref_paths,
     class_schema_text,
     frame_annotation_transforms,
     frame_postprocessor,
@@ -82,6 +86,10 @@ _LABEL_EXAMPLE_IN = "[示例输入]"
 _LABEL_EXAMPLE_OUT = "[示例输出]"
 _LABEL_TEXT_RECORD = "[待标注数据]"
 _LABEL_SCREENSHOT = "[屏幕截图]"
+_LABEL_ORIGINAL_IMAGE = "[原图]"
+_LABEL_REGION_OVERLAY = "[候选区域叠图]"
+_LABEL_REFERENCE_BOXES = "[参考框]"
+_LABEL_CANDIDATES = "[候选区域]"
 _LABEL_UI_TREE = "[UI 控件树]"
 _LABEL_PREV_OUTPUT = "[上一版标注]"
 _LABEL_CRITIQUES = "[审核意见]"
@@ -174,6 +182,7 @@ class AnnotatePromptOptions:
     transitions: tuple[Transition, ...] | None = None   # v1.8 [动作序列] 步骤；None = 整段省略
     image_px: int | None = None                    # v1.11（V23①）升档后的图像采样边长
     temporal_context: SequenceTemporalContext | None = None  # v1.20 同一最终 sequence 冻结时间上下文
+    regions: RegionSet | None = None               # v1.22 图片模式：选择 §10.1 图片变体；自洽与修复共用同一对象
 
 
 _DEFAULT_PROMPT_OPTIONS = AnnotatePromptOptions()
@@ -195,14 +204,19 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
     @return M8 成功四元组
     """
     profile = ctx.cfg.annotate.llm
+    regions = opts.regions
+    region_paths = () if regions is None else class_region_ref_paths(ctx.cfg, opts.label)
     scope = CallScope(record_ids=(record.id,), batch_no=ctx.batch_no,
-                      record=annotation_record_context(record), complete_evidence=ctx.session_attempt is not None,
-                      retain_repair_prompt=ctx.cfg.run.mode == "process")
+                      record=annotation_record_context(record, regions),
+                      complete_evidence=ctx.session_attempt is not None,
+                      retain_repair_prompt=ctx.cfg.run.mode == "process",
+                      region_ids=None if regions is None else frozenset(item.region_id for item in regions.regions),
+                      region_ref_paths=region_paths)
     postprocessor = record_postprocessor(ctx.cfg, opts.label)
     view = ctx.cfg.class_views.get(opts.label) if opts.label is not None else None
     if postprocessor is not None or (view is not None and view.time_bindings):
         finalizer, projector = annotation_transforms(
-            record, ctx.cfg, opts.label, opts.temporal_context,
+            record, ctx.cfg, opts.label, opts.temporal_context, regions,
         )
         try:
             return await ctx.schema_engine.complete_finalized(FinalizedCallRequest(
@@ -210,13 +224,16 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
                 prompt=prompt,
                 model_schema=class_effective_model_schema(ctx.cfg, opts.label),
                 final_schema=class_effective_schema(ctx.cfg, opts.label),
-                scope=replace(scope, user_treatment=True),
+                # 校验器与工程函数的第二入参取自同一次上下文构造。
+                scope=replace(scope, user_treatment=True, record=finalizer.record),
                 candidate_finalizer=finalizer,
                 repair_projector=projector,
             ))
         except CandidateFinalizerContractError:
             annotation_contract_error("annotation candidate finalizer contract failed")
-    schema = class_annotate_schema(ctx.cfg, opts.label)
+    # 区域引用注解只留在完整 Schema；端点与 L2 用删除注解后的模型 Schema。
+    schema = (class_effective_model_schema(ctx.cfg, opts.label) if region_paths
+              else class_annotate_schema(ctx.cfg, opts.label))
     if schema is None:
         return await ctx.schema_engine.complete_validated(profile, prompt,
                                                           scope=scope)
@@ -250,7 +267,7 @@ class _PackScale:
     schema_est: int     # Schema 文本计量（结构化输出关闭时为 0）
     text_est: int       # 本次装配的文本侧计量
     image_cost: int     # 单图成本（无图时 0）
-    image_count: int     # 实际完整图片数；普通记录至多一张，生成文本序列为零
+    image_count: int     # 实际完整图片数：普通记录至多一张，图片模式样本两张（原图与叠图），生成文本序列为零
 
 
 def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
@@ -326,7 +343,8 @@ def _fit_block(body: str, share: int | None) -> tuple[str, int]:
 # ── §10.1 提示词装配（公开面签名按 CONTRACTS §7.4 冻结）──────────────────────
 #
 # 段序固定：system（任务指令 + Schema 约束句 + Schema 文本）→ 每条 few-shot 一条
-# user 消息（配置序）→ 当前记录 user 消息（text 一段，或 ui 的截图 + 控件树三段）。
+# user 消息（配置序）→ 当前记录 user 消息（text 一段，或 ui 的截图 + 控件树三段；
+# 图片模式为原图、候选区域叠图、可选参考框与候选区域数据）。
 # 处理序列先渲染全部动作，再按成员序渲染完整正文、树和每张图片。
 # 最后部件恒为文本，修复后缀附在该文本上；生成文本序列保持独立预算路径。
 
@@ -364,12 +382,14 @@ def _assemble_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
     messages = _prelude_messages(acfg, schema_text)
     if record.kind == "sequence":              # v1.8 序列变体（判定先于模态）
         parts = _sequence_parts(record, cfg, opts, fit)
+    elif opts.regions is not None:             # v1.22 图片变体：没有可裁槽位，fit 不适用
+        parts = _image_record_parts(record, cfg, opts.regions)
     else:
         parts = _single_record_parts(record, cfg, fit)
     if opts.repair is not None:
         parts = _with_repair_suffix(parts, opts.repair)
     messages.append(Message(role="user", parts=parts))
-    image_px = None if cfg.run.mode == "process" and cfg.segment.enabled else opts.image_px
+    image_px = None if cfg.run.mode == "process" and cfg.segment.sequence_resolved else opts.image_px
     return PromptBundle(messages=tuple(messages), temperature=opts.temperature, image_px=image_px)
 
 
@@ -402,7 +422,7 @@ def _sequence_parts(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptO
     @param fit ④ 裁剪指令；None = 不裁
     @return 当前记录 user 消息的 parts 元组
     """
-    if cfg.run.mode == "process" and cfg.segment.enabled:
+    if cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         return complete_parts(record, opts)
     parts: list[Part] = []
     if opts.transitions is not None:           # ① transitions 为 None 时整段省略
@@ -431,6 +451,9 @@ def _single_record_parts(record: Record, cfg: "ResolvedConfig",
     """
     if record.modality == "text":
         return (Part(kind="text", text=f"{_LABEL_TEXT_RECORD} {record.text}"),)
+    if record.ui_tree is None:                 # v1.22 图片模式恒无树：不序列化，不渲染空树段
+        return (Part(kind="text", text=_LABEL_ORIGINAL_IMAGE),
+                Part(kind="image", image=record.image))
     tree_text = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
     if fit is not None and fit.tree_budget is not None:
         tree_text, trimmed = _fit_tree_text(tree_text, max(0, fit.tree_budget))
@@ -443,11 +466,33 @@ def _single_record_parts(record: Record, cfg: "ResolvedConfig",
     )
 
 
+def _image_record_parts(record: Record, cfg: "ResolvedConfig", regions: RegionSet) -> tuple[Part, ...]:
+    """装配图片模式当前记录的 §10.1 图片变体；候选块与参考框块都是固定块，从不裁剪。
+
+    @param record 图片模式样本
+    @param cfg 已解析配置（segment.instruction 决定是否走模型路径）
+    @param regions 信封上冻结的分割结果
+    @return 当前记录 user 消息的 parts 元组，末段恒为文本
+    """
+    parts = [
+        Part(kind="text", text=_LABEL_ORIGINAL_IMAGE),
+        Part(kind="image", image=record.image),
+        Part(kind="text", text=_LABEL_REGION_OVERLAY),
+        Part(kind="image", image=RegionOverlayRef(record.image, regions)),
+    ]
+    if regions.boxes and cfg.segment.instruction:   # D15 路径省略：每个候选本身就是一个参考框
+        parts.append(Part(kind="text", text=f"{_LABEL_REFERENCE_BOXES}\n{render_reference_boxes(regions)}"))
+    parts.append(Part(kind="text", text=(f"{_LABEL_CANDIDATES}\n{render_candidates(regions)}\n"
+                                         f"{render_material_note(regions)}")))
+    return tuple(parts)
+
+
 def _with_repair_suffix(parts: tuple[Part, ...],
                         repair: RepairContext) -> tuple[Part, ...]:
     """把 §10.5 修复后缀拼到末段文本上。
 
-    @param parts 当前记录消息的 parts（末段恒为文本段，S6 模板不变式）
+    @param parts 当前记录消息的 parts（末段恒为文本段，S6 模板不变式；只有无树记录以图片收尾，
+        后缀此时单独成段）
     @param repair 修复上下文
     @return 末段被替换为「原文 + 后缀」的新 parts 元组
 
@@ -458,6 +503,8 @@ def _with_repair_suffix(parts: tuple[Part, ...],
               f"{_LABEL_CRITIQUES} {repair.critiques_text}\n"
               f"{_REPAIR_TAIL}")
     last = parts[-1]
+    if last.kind != "text":
+        return parts + (Part(kind="text", text=suffix),)
     return parts[:-1] + (Part(kind="text", text=f"{last.text}\n{suffix}"),)
 
 
@@ -560,7 +607,7 @@ def _trim_state(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptio
             step_budget=step_share if opts.transitions is not None else None,
             digest_budget=digest_share)
     if record.modality == "ui":
-        # §3.3③ 单记录族：树渲染是唯一可裁槽位。
+        # §3.3③ 单记录族：树渲染是唯一可裁槽位；图片模式无树，份额落空，由 _trim_pack 明确溢出。
         tree_body = (record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
                      if record.ui_tree else "")
         fixed = scale.text_est - budget.est_text(tree_body)
@@ -609,7 +656,7 @@ async def _budgeted_call(record: Record, ctx: "RunContext", schema_text: str,
     @return 通过模型及最终 Schema 校验的结果
     @raises ContextOverflowError 完整请求容量不足，保持原始异常"""
     cfg = ctx.cfg
-    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.enabled:
+    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         request = sequence_request(record, ctx, schema_text, opts)
         error = request_overflow(request, ctx)
         if error is not None:
@@ -1023,7 +1070,7 @@ def _assemble_frame_prompt(member: Record, cfg: "ResolvedConfig",
             Part(kind="text", text=f"{_FRAME_LABEL_MEMBER} {member.text}"),
         )
     else:  # ui 成员：三段形（镜像本文件单记录 ui 标注）
-        complete = cfg.run.mode == "process" and cfg.segment.enabled
+        complete = cfg.run.mode == "process" and cfg.segment.sequence_resolved
         tree_text = (record_evidence(member) if complete else
                      member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars))
         if not complete and fit is not None and fit.tree_budget is not None:
@@ -1143,7 +1190,7 @@ def _frame_call_prompt(member: Record, ctx: "RunContext", label: str | None) -> 
     schema = _thaw_json(cfg.model_frame_schema)
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
     profile = cfg.llm_profiles.get(cfg.frame_annotate.llm)
-    if cfg.run.mode == "process" and cfg.segment.enabled:
+    if cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         prompt = build_frame_annotate_prompt(member, cfg, schema_text, label=label)
         error = request_overflow(CapacityRequest(cfg.frame_annotate.llm, prompt, schema), ctx)
         if error is not None:
@@ -1178,7 +1225,7 @@ async def annotate_member_leaf(member: Record, ctx: "RunContext", label: str | N
     prompt = _frame_call_prompt(member, ctx, label)
     scope = CallScope(
         record_ids=(member.id,), batch_no=ctx.batch_no,
-        record=annotation_record_context(member), complete_evidence=ctx.session_attempt is not None,
+        record=annotation_record_context(member, None), complete_evidence=ctx.session_attempt is not None,
     )
     postprocessor = frame_postprocessor(cfg, label)
     if postprocessor is None:
@@ -1467,6 +1514,7 @@ class AnnotateStage:
             options = AnnotatePromptOptions(
                 label=label, transitions=item.transitions,
                 temporal_context=item.temporal_context,
+                regions=item.regions,
             )
             try:
                 planned = _sample_plans(item.record, ctx, options)

@@ -900,7 +900,7 @@ def _stream_cfg(*, policy="repair", max_repair_rounds=1, judges=(),
     return replace(
         base,
         run=replace(base.run, modality="ui"),
-        segment=SegmentConfig(enabled=True),
+        segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
         llm_profiles={name: _budget_profile(name, 1000000) for name in {"judge", "default", *judges}},
         stitch=StitchConfig(),
         extract=ExtractConfig(enabled=extract_enabled),
@@ -4051,3 +4051,19 @@ def test_frame_planning_collects_every_synchronous_capacity_error(monkeypatch):
     assert calls == [(0,), (1,), (2,)]
     assert [failure.targets[0].member_positions for failure in captured.value.failures] == calls
     assert all(episode.status == "active" for episode in episodes)
+
+
+# ── v1.22 图片变体的回归锚：文本与普通 UI 的字节与计费不变 ───────────────────────
+
+def test_review_without_regions_keeps_text_ui_bytes_and_single_image_fit():
+    cfg = replace(trace_cfg(enabled=False), verify=VerifyConfig(enabled=True, llm="judge"),
+                  llm_profiles={"judge": _budget_profile("judge", 4096)})
+    assert VerifyPromptOptions().regions is None
+    user = build_verify_prompt(_record(text="原文"), {"intent": "qa"}, cfg).messages[-1]
+    assert [part.text for part in user.parts] == [
+        '[任务指令] 给指令分类。\n[原始数据] 原文\n[标注结果] {"intent": "qa"}']
+    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(70)))
+    stage = VerifyStage(cfg)
+    assert stage._panel_fit(ctx, _ui_single_record(), VERDICT_SCHEMA).image_cost == 70
+    assert stage._panel_fit(ctx, _ui_single_record(), VERDICT_SCHEMA, None).image_cost == 70
+    assert stage._panel_fit(ctx, _record(), VERDICT_SCHEMA).image_cost == 0

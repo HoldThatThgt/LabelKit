@@ -38,7 +38,7 @@ async def test_real_ingest_segment_dedup_emitter_preserve_full_session_across_co
     source.write_text(''.join(json.dumps({"text": "same complete frame"}) + '\n' for _ in range(6)))
     products = []
     for size in (1, 3):
-        cfg = stream_cfg(tmp_path, batch_size=size, segment=SegmentConfig(enabled=True, strategy="rules"))
+        cfg = stream_cfg(tmp_path, batch_size=size, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"))
         output = str(tmp_path / f"result-{size}.jsonl")
         paths = ResolvedPaths(str(tmp_path / "project.toml"), str(tmp_path), str(source), output,
                               str(tmp_path / f"report-{size}.json"), None, None, None, None, None, None)

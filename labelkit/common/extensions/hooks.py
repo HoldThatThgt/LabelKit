@@ -17,6 +17,14 @@ M1 经 ``importlib.util.spec_from_file_location`` 装载，module name 由绝对
 - ``generate.state_validator`` —— ``fn(value: StateTransitionInput) -> list[str]``，
   在事件计划的后置验证阶段检查一次冻结状态转换。
 
+另有两种形态不返回违规列表，各自的边界在独立模块：
+
+- ``annotate.postprocessor``（含 ``frame.annotate.postprocessor``）——
+  ``fn(candidate: dict, record: Mapping | None) -> dict``，见 ``postprocessing.py``。
+- ``segment.box_parser`` —— ``fn(companion: bytes, image: dict) -> list[dict] | None``，
+  把伴随文件的原始字节转成参考框数组，返回 ``None`` 表示拒收本样本；只在 segment 阶段调用，
+  启动期只做静态签名检查，违约抛 ``BoxParserError``，见 ``box_parser.py``。
+
 旧 ``sequence_validator``、``scenario_validator`` 与 ``"module:function"`` 解析面已删除。
 """
 from __future__ import annotations

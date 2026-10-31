@@ -28,6 +28,7 @@ import httpx
 
 from labelkit.common.config.model import EmbeddingProfile, LLMProfile
 from labelkit.common.contracts.execution import ResourceKey, ResourceLimiter
+from labelkit.common.contracts.regions import RegionOverlayRef
 from labelkit.common.contracts.types import ImageRef, Usage
 from labelkit.common.errors import (
     CircuitBreakerTripped,
@@ -149,7 +150,7 @@ class Part:
     """一条消息内的单个内容片段（文本或图像）。"""
     kind: Literal["text", "image"]                 # 片段类型
     text: str | None = None                        # kind="text" 时的文本内容
-    image: ImageRef | None = None                  # kind="image" 时的图像引用（字节惰性加载）
+    image: ImageRef | RegionOverlayRef | None = None  # kind="image" 时的图像引用（字节惰性加载）
 
 
 @dataclass(frozen=True)
@@ -846,7 +847,7 @@ def _accumulate_usage(acc: ProfileUsage, usage: Usage, retries: int,
 
 def _render_trace_messages(prompt: PromptBundle) -> list[dict]:
     """渲染 trace.content='full' 的 gen_ai.input.messages 载荷。图像只按路径引用、
-    绝不内联（base64 载荷不属于 trace）。
+    绝不内联（base64 载荷不属于 trace）；叠图记原图路径加 overlay 标记。
 
     @param prompt 本次请求的消息束
     @return 可序列化的消息列表
@@ -857,6 +858,8 @@ def _render_trace_messages(prompt: PromptBundle) -> list[dict]:
         for part in msg.parts:
             if part.kind == "text":
                 content.append({"type": "text", "text": part.text or ""})
+            elif isinstance(part.image, RegionOverlayRef):
+                content.append({"type": "image", "path": str(part.image.base.path), "overlay": "regions"})
             else:
                 content.append({"type": "image",
                                 "path": str(part.image.path) if part.image else ""})

@@ -55,6 +55,7 @@ PRIOR_INFLATION = 1.2         # 首批先验保守放大（V17）
 TEMPLATE_HEAD_TOKENS: dict[str, int] = {
     "segment": 484,   # §10.9 完整静态脚手架（模板头 + 结构句，
                       # with_reason 变体——见上方例外说明）
+    "segment_image": 410,   # segment_image._SYSTEM_STATIC（§10.20）
     "classify": 48,   # classify._SYSTEM_HEAD_MULTI（§10.8）
     "quality": 39,    # §10.2 成对判决/结构句（内联字面量）
     "annotate": 32,   # annotate._SCHEMA_SENTENCE（§10.1）

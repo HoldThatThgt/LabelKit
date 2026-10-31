@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import inspect
+import io
 import json
 import logging
 import math
@@ -77,6 +79,7 @@ from labelkit.common.inference.llm_client import (
     _RetryContext,
     _split_embed,
 )
+from labelkit.common.contracts.regions import CandidateRegion, RegionOverlayRef, RegionPolygon, RegionSet
 from labelkit.common.contracts.types import ImageRef, Usage
 from tests.common.config.test_config import BASE_CONFIG, Env, env, has  # noqa: F401 (fixture)
 from tests.llm_client_helpers import make_llm_client as _client
@@ -489,6 +492,74 @@ def test_render_trace_messages_references_images_by_path(png_image: ImageRef):
             {"type": "image", "path": str(png_image.path)},   # path, never base64
         ]},
     ]
+
+
+def _overlay_of(image: ImageRef) -> RegionOverlayRef:
+    polygon = RegionPolygon(exterior=((0, 0), (3, 0), (3, 3), (0, 3), (0, 0)), holes=())
+    region = CandidateRegion(region_id="r1", polygons=(polygon,), box_id=None, source_box_ids=(),
+                             label_anchor=(1.5, 1.5))
+    return RegionOverlayRef(base=image, regions=RegionSet(width=4, height=4, boxes=(), regions=(region,)))
+
+
+def _overlay_prompt(image: ImageRef) -> PromptBundle:
+    return PromptBundle(messages=(
+        Message(role="system", parts=(Part(kind="text", text="sys"),)),
+        Message(role="user", parts=(
+            Part(kind="text", text="[原图]"),
+            Part(kind="image", image=image),
+            Part(kind="text", text="[候选区域叠图]"),
+            Part(kind="image", image=_overlay_of(image)),
+        )),
+    ))
+
+
+def test_render_trace_messages_marks_overlay_with_base_path(png_image: ImageRef):
+    assert _render_trace_messages(_overlay_prompt(png_image))[1]["content"] == [
+        {"type": "text", "text": "[原图]"},
+        {"type": "image", "path": str(png_image.path)},
+        {"type": "text", "text": "[候选区域叠图]"},
+        {"type": "image", "path": str(png_image.path), "overlay": "regions"},
+    ]
+
+
+def test_openai_body_encodes_overlay_as_png_after_unchanged_base(png_image: ImageRef):
+    body = _build_openai_body(_llm_profile(), _overlay_prompt(png_image), None)
+    original = base64.b64encode(png_image.path.read_bytes()).decode("ascii")
+    _, overlay_b64 = _overlay_of(png_image).load_base64(2048)
+    assert body["messages"][1]["content"] == [
+        {"type": "text", "text": "[原图]"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{original}"}},
+        {"type": "text", "text": "[候选区域叠图]"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{overlay_b64}"}},
+    ]
+    assert overlay_b64 != original
+
+
+def test_anthropic_body_encodes_overlay_as_png_after_unchanged_base(png_image: ImageRef):
+    body = _build_anthropic_body(_llm_profile(provider="anthropic"), _overlay_prompt(png_image), None)
+    original = base64.b64encode(png_image.path.read_bytes()).decode("ascii")
+    _, overlay_b64 = _overlay_of(png_image).load_base64(2048)
+    assert body["messages"][0]["content"] == [
+        {"type": "text", "text": "[原图]"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": original}},
+        {"type": "text", "text": "[候选区域叠图]"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": overlay_b64}},
+    ]
+
+
+def test_overlay_uses_the_request_working_point_of_the_base(tmp_path: Path):
+    path = tmp_path / "image_1.jpg"
+    Image.new("RGB", (1080, 2340), (9, 9, 9)).save(path, format="JPEG")
+    image = ImageRef(path=path, format="jpeg", size_bytes=path.stat().st_size)
+    prompt = dataclasses.replace(_overlay_prompt(image), image_px=512)
+    blocks = _build_anthropic_body(_llm_profile(provider="anthropic"), prompt, None)["messages"][0]["content"]
+    sizes = []
+    for block in (blocks[1], blocks[3]):
+        with Image.open(io.BytesIO(base64.b64decode(block["source"]["data"]))) as decoded:
+            sizes.append(decoded.size)
+    assert blocks[1]["source"]["media_type"] == "image/jpeg"
+    assert blocks[3]["source"]["media_type"] == "image/png"
+    assert sizes[0] == sizes[1] == (236, 512)
 
 
 def test_render_output_messages_text_and_structured():

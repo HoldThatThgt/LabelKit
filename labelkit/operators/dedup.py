@@ -7,9 +7,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import secrets
 import unicodedata
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Sequence
 
 import imagehash
@@ -28,6 +30,7 @@ from labelkit.common.errors import (
 )
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.generation import DedupGroupRequest, DedupReservation
+from labelkit.common.contracts.regions import RegionSet
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import DedupInfo, PipelineItem, Record, StageError
 from labelkit.common.inference import budget
@@ -44,6 +47,9 @@ _EV_ERROR = "error"
 _LOGGER = logging.getLogger("labelkit.dedup")
 # 日志记录附加字段：索引层不知道批次号，故 batch 留空（文本格式化器渲染为 "-"）
 _LOG_EXTRA: dict[str, Any] = {"stage": "dedup", "batch": None}
+
+# Pillow 打开 16 位灰度图的模式随版本与字节序不同（pyproject 允许 Pillow>=10.1）
+_INTEGER_IMAGE_MODES = frozenset({"I", "I;16", "I;16L", "I;16B"})
 
 
 def _dedup_contract_error(message: str) -> NoReturn:
@@ -116,6 +122,39 @@ def _generation_exact_material(rec: Record) -> str | None:
     )
 
 
+def _image_exact_material(rec: Record) -> str:
+    """构造图片模式样本的域分离精确键（v1.22）。
+
+    @param rec M2 已写入内容摘要的图片模式记录
+    @return canonical JSON 键
+    """
+    return json.dumps(
+        ["labelkit:image", "exact", rec.image_sha256, rec.companion_sha256],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _box_dedup_text(regions: RegionSet | None, quantize_px: int) -> str:
+    """用参考框构造图片模式的树侧判重文本：每框一行 ``[l,t,r,b] text``，不含框名。
+
+    坐标按精确有理数地板除（``q = 0`` 时直接取地板），恒为 int；text 经 JSON 转义，所以不会伪造
+    出另一行。框按钩子返回顺序拼接。
+
+    @param regions 信封上的分割结果；未运行分割时为 None
+    @param quantize_px dedup.bounds_quantize_px
+    @return 规范文本；没有参考框时为空串（树侧缺席）
+    """
+    if regions is None:
+        return ""
+    divisor = quantize_px if quantize_px > 0 else 1
+    lines = []
+    for box in regions.boxes:
+        l, t, r, b = (math.floor(Fraction(value) / divisor) for value in box.bbox)
+        lines.append(f"[{l},{t},{r},{b}] {json.dumps(box.text, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
 def _shingles(text: str, n: int) -> set[str]:
     """在（已折叠空白的）文本上做字符 n-gram 滑窗，取 shingle 集合。
 
@@ -150,11 +189,21 @@ def _build_minhash(text: str, ngram: int, num_perm: int) -> MinHash | None:
 def _phash_int(image_path) -> int:
     """计算 64 位感知哈希（imagehash 默认的 DCT pHash）并打包成整数。
 
+    imagehash 内部的 ``convert("L")`` 把超过 255 的值全部削成白，所以整数模式的图
+    若最大值超过 255，先按本图最大值线性缩放到 8 位；其余图像原样哈希。
+
     @param image_path 图像文件路径
     @return 64 位 pHash 的整数形式
     """
     with Image.open(image_path) as im:
-        h = imagehash.phash(im)
+        source = im
+        if im.mode in _INTEGER_IMAGE_MODES:
+            # I;16L / I;16B 不支持 getextrema 与 point, 统一先转成 32 位 I。
+            widened = im.convert("I")
+            hi = widened.getextrema()[1]
+            if hi > 255:
+                source = widened.point(lambda v: v * (255 / hi)).convert("L")
+        h = imagehash.phash(source)
     value = 0
     for bit in h.hash.flatten():
         value = (value << 1) | int(bit)
@@ -200,6 +249,7 @@ class _ProbeDetail:
     image_hit: tuple[str, str, int] | None = None       # (保留记录 id, 簇键, 汉明距离)
     image_decode_failed: bool = False                   # 图像解码失败 ⇒ 本记录跳过 pHash 层
     verdict: DedupInfo | None = None                    # 最终判决（复合后回填）
+    image_sample: bool = False                          # v1.22 图片模式样本：无语义层；无框时树侧缺席
 
 
 @dataclass(frozen=True)
@@ -320,6 +370,8 @@ class DedupIndex:
         @param rec 待判重记录
         @return exact、MinHash、pHash 与静态身份特征
         """
+        if rec.image_sha256 is not None:       # 图片摘要只由图片模式的 M2 写入
+            return self.prepare_image_sample(rec, None)
         exact_material = _generation_exact_material(rec)
         text = exact_material if exact_material is not None else _dedup_text(rec, self.cfg)
         digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -330,6 +382,21 @@ class DedupIndex:
             detail.minhash = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
         if not detail.exact_only and self.modality == "ui" and rec.image is not None:
             self._prepare_image(rec.image.path, detail)
+        return detail
+
+    def prepare_image_sample(self, rec: Record, regions: RegionSet | None) -> _ProbeDetail:
+        """冻结一个图片模式样本的特征：精确键含内容摘要，MinHash 取自参考框，pHash 照常计算。
+
+        @param rec 图片模式记录
+        @param regions 信封上的分割结果
+        @return 该样本的探测便签
+        """
+        text = _box_dedup_text(regions, self.cfg.bounds_quantize_px)
+        digest = hashlib.sha256(_image_exact_material(rec).encode("utf-8")).digest()
+        detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16],
+                              image_sample=True)
+        detail.minhash = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
+        self._prepare_image(rec.image.path, detail)
         return detail
 
     def probe_prepared(self, detail: _ProbeDetail) -> DedupInfo:
@@ -436,6 +503,9 @@ class DedupIndex:
             # （按树判定）」、CONTRACTS.md §7.2）：对本记录而言 "both" 与 "image" 都退
             # 化为 "tree"。序列记录走同构的退化（spec 3.3.3 序列行，S10）。
             requires = "tree"
+        elif requires == "both" and detail.image_sample and detail.minhash is None:
+            # v1.22：没有参考框的图片样本树侧缺席，"both" 对本记录退化为 "image"。
+            requires = "image"
         if requires == "both":
             is_dup = tree is not None and image is not None
         elif requires == "tree":
@@ -899,7 +969,8 @@ class DedupStage:
             if item.status != "active":
                 continue
             try:
-                detail = self.index.prepare(item.record)
+                detail = (self.index.prepare(item.record) if item.record.image_sha256 is None
+                          else self.index.prepare_image_sample(item.record, item.regions))
                 embed_input = None
                 if self.cfg.semantic and self._semantic_participates(detail):
                     embed_input = self._embed_input(detail, ctx)
@@ -1143,7 +1214,7 @@ class DedupStage:
         @param detail 本记录的探测便签
         @return True 表示 ④ 级参与
         """
-        if detail.exact_only:
+        if detail.exact_only or detail.image_sample:
             return False
         if self.index.modality == "text" or self.cfg.ui_dup_requires != "image":
             return True

@@ -95,7 +95,7 @@ def _independent_semantic_value(value):
         return {
             field.name: _independent_semantic_value(getattr(value, field.name))
             for field in dataclasses.fields(value)
-            if field.name != "digest"
+            if field.name not in ("digest", "region_ref_paths")
         }
     if isinstance(value, Mapping):
         return {str(key): _independent_semantic_value(item) for key, item in value.items()}

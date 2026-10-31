@@ -1,0 +1,206 @@
+{
+  "_note": "z.ai 图片分割门的人工标注夹具。references 的 polygon 是按图片人工勾画的原图像素坐标（x 向右，y 向下），只给测试代码计算 IoU；candidates 的 rect 是 0-1000 网格 [l, t, r, b]，用来构造注入 annotate 的固定候选。",
+  "segmentation_instruction": "为图片中每个可以独立指认的物体或控件生成一个候选区域，区域贴合它的实际轮廓。不要生成覆盖整张图片的背景区域。有参考框且参考框准确时直接复用。",
+  "quality_groups": [
+    {
+      "name": "pure_image",
+      "hook": false,
+      "samples": [
+        {
+          "image": "examples/image-segmentation/data/photos/image_1.png",
+          "companion": null,
+          "references": [
+            {"label": "sun", "keywords": ["太阳", "sun", "圆", "circle"],
+             "polygon": [[720, 60], [760, 71], [790, 100], [801, 140], [790, 180], [760, 210], [720, 221], [680, 210], [650, 180], [639, 140], [650, 100], [680, 71]]},
+            {"label": "house", "keywords": ["房", "屋", "house", "building", "建筑"],
+             "polygon": [[150, 241], [320, 110], [491, 241], [461, 241], [461, 461], [180, 461], [180, 241]]}
+          ]
+        },
+        {
+          "image": "examples/image-segmentation/data/photos/image_2.png",
+          "companion": null,
+          "references": [
+            {"label": "plate", "keywords": ["盘", "圆", "靶", "plate", "circle", "disc", "disk", "target"],
+             "polygon": [[260, 140], [331, 159], [381, 210], [401, 280], [381, 350], [331, 401], [260, 421], [189, 401], [139, 350], [120, 280], [139, 210], [189, 159]]},
+            {"label": "tall_block", "keywords": ["矩形", "长方", "色块", "rectangle", "block", "bar"],
+             "polygon": [[520, 120], [641, 120], [641, 481], [520, 481]]},
+            {"label": "short_block", "keywords": ["矩形", "长方", "色块", "rectangle", "block", "bar"],
+             "polygon": [[700, 180], [781, 180], [781, 421], [700, 421]]}
+          ]
+        },
+        {
+          "image": "examples/ui/data/image_1.png",
+          "companion": null,
+          "references": [
+            {"label": "top_bar", "keywords": [], "polygon": [[0, 0], [400, 0], [400, 61], [0, 61]]},
+            {"label": "input_one", "keywords": [], "polygon": [[32, 160], [369, 160], [369, 217], [32, 217]]},
+            {"label": "input_two", "keywords": [], "polygon": [[32, 240], [369, 240], [369, 297], [32, 297]]},
+            {"label": "primary_button", "keywords": [], "polygon": [[32, 340], [369, 340], [369, 397], [32, 397]]}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook_returns_empty",
+      "hook": true,
+      "samples": [
+        {
+          "image": "examples/image-segmentation/data/screens-xml/image_1.png",
+          "companion": {"literal": "empty"},
+          "references": [
+            {"label": "sign_in", "keywords": [], "polygon": [[60, 300], [481, 300], [481, 381], [60, 381]]},
+            {"label": "register", "keywords": [], "polygon": [[60, 420], [481, 420], [481, 501], [60, 501]]},
+            {"label": "forgot_password", "keywords": [], "polygon": [[60, 540], [481, 540], [481, 601], [60, 601]]}
+          ]
+        },
+        {
+          "image": "examples/image-segmentation/data/screens-xml/image_2.png",
+          "companion": {"path": "examples/image-segmentation/data/screens-xml/image_2.xml"},
+          "references": [
+            {"label": "loading_title", "keywords": [], "polygon": [[60, 130], [240, 130], [240, 177], [60, 177]]}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook_returns_shell",
+      "hook": true,
+      "samples": [
+        {
+          "image": "examples/image-segmentation/data/photos/image_2.png",
+          "companion": {"literal": "shell"},
+          "references": [
+            {"label": "plate", "keywords": [],
+             "polygon": [[260, 140], [331, 159], [381, 210], [401, 280], [381, 350], [331, 401], [260, 421], [189, 401], [139, 350], [120, 280], [139, 210], [189, 159]]},
+            {"label": "tall_block", "keywords": [], "polygon": [[520, 120], [641, 120], [641, 481], [520, 481]]},
+            {"label": "short_block", "keywords": [], "polygon": [[700, 180], [781, 180], [781, 421], [700, 421]]}
+          ]
+        },
+        {
+          "image": "examples/image-segmentation/data/documents/image_1.png",
+          "companion": {"literal": "shell"},
+          "references": [
+            {"label": "invoice_line", "keywords": [], "polygon": [[60, 85], [262, 85], [262, 120], [60, 120]]},
+            {"label": "total_line", "keywords": [], "polygon": [[60, 185], [322, 185], [322, 220], [60, 220]]},
+            {"label": "footer_line", "keywords": [], "polygon": [[60, 905], [312, 905], [312, 940], [60, 940]]}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "aligned_reference_boxes",
+      "hook": true,
+      "samples": [
+        {
+          "image": "examples/image-segmentation/data/screens-xml/image_1.png",
+          "companion": {"path": "examples/image-segmentation/data/screens-xml/image_1.xml"},
+          "references": [
+            {"label": "sign_in", "keywords": [], "polygon": [[60, 300], [481, 300], [481, 381], [60, 381]]},
+            {"label": "register", "keywords": [], "polygon": [[60, 420], [481, 420], [481, 501], [60, 501]]},
+            {"label": "forgot_password", "keywords": [], "polygon": [[60, 540], [481, 540], [481, 601], [60, 601]]}
+          ]
+        },
+        {
+          "image": "examples/image-segmentation/data/screens-json/image_1.png",
+          "companion": {"path": "examples/image-segmentation/data/screens-json/image_1.json"},
+          "references": [
+            {"label": "sign_in", "keywords": [], "polygon": [[60, 300], [481, 300], [481, 381], [60, 381]]},
+            {"label": "register", "keywords": [], "polygon": [[60, 420], [481, 420], [481, 501], [60, 501]]}
+          ]
+        }
+      ]
+    }
+  ],
+  "annotate_cases": [
+    {
+      "name": "colour_blocks",
+      "image": "examples/image-segmentation/data/photos/image_2.png",
+      "candidates": [[133, 233, 444, 700], [578, 200, 712, 802], [778, 300, 868, 702], [44, 800, 122, 950]],
+      "prompts": [
+        {"instruction": "选出所有矩形色块，其余候选不要选。label 写色块颜色，只能是 beige、blue、white、brown 之一。",
+         "expected": {"r2": "beige", "r3": "blue"}},
+        {"instruction": "选出圆形物体，其余候选不要选。label 写它外圈的颜色，只能是 beige、blue、white、brown 之一。",
+         "expected": {"r1": "white"}}
+      ]
+    },
+    {
+      "name": "login_buttons",
+      "image": "examples/image-segmentation/data/screens-xml/image_1.png",
+      "candidates": [[111, 313, 891, 397], [111, 438, 891, 522], [111, 563, 891, 626], [111, 130, 500, 188]],
+      "prompts": [
+        {"instruction": "选出所有按钮，不要选标题。label 写按钮上的文字原文。",
+         "expected": {"r1": "Sign in", "r2": "Register", "r3": "Forgot password"}},
+        {"instruction": "选出用来注册新账号的按钮，其余候选不要选。label 写 register。",
+         "expected": {"r2": "register"}}
+      ]
+    },
+    {
+      "name": "scene_objects",
+      "image": "examples/image-segmentation/data/photos/image_1.png",
+      "candidates": [[710, 100, 890, 368], [167, 183, 546, 768], [0, 667, 1000, 1000]],
+      "prompts": [
+        {"instruction": "选出天空中的发光天体，其余候选不要选。label 写 sun。",
+         "expected": {"r1": "sun"}},
+        {"instruction": "选出建筑物，其余候选不要选。label 写 house。",
+         "expected": {"r2": "house"}}
+      ]
+    },
+    {
+      "name": "form_controls",
+      "image": "examples/ui/data/image_1.png",
+      "candidates": [[0, 0, 1000, 77], [80, 425, 923, 497], [80, 525, 128, 549], [80, 200, 923, 272]],
+      "prompts": [
+        {"instruction": "选出方形复选框，其余候选不要选。label 写 checkbox。",
+         "expected": {"r3": "checkbox"}},
+        {"instruction": "选出带灰色边框的输入框，其余候选不要选。label 写 input。",
+         "expected": {"r4": "input"}}
+      ]
+    }
+  ],
+  "ablation_cases": [
+    {
+      "name": "button_text",
+      "image": "examples/image-segmentation/data/screens-xml/image_1.png",
+      "candidates": [[111, 313, 891, 397], [111, 438, 891, 522], [111, 563, 891, 626]],
+      "prompts": [
+        {"instruction": "选出按钮文字是 Sign in 的候选，其余候选不要选。label 写该候选上的文字原文。",
+         "expected": {"r1": "Sign in"}},
+        {"instruction": "选出按钮文字是 Register 的候选，其余候选不要选。label 写该候选上的文字原文。",
+         "expected": {"r2": "Register"}},
+        {"instruction": "选出按钮文字是 Forgot password 的候选，其余候选不要选。label 写该候选上的文字原文。",
+         "expected": {"r3": "Forgot password"}}
+      ]
+    },
+    {
+      "name": "document_lines",
+      "image": "examples/image-segmentation/data/documents/image_1.png",
+      "candidates": [[75, 85, 328, 120], [75, 185, 403, 220], [75, 905, 390, 940]],
+      "prompts": [
+        {"instruction": "选出写着应付金额的文字行，其余候选不要选。label 写该行文字原文。",
+         "expected": {"r2": "Total due 318.40"}},
+        {"instruction": "选出写着发票编号的文字行，其余候选不要选。label 写该行文字原文。",
+         "expected": {"r1": "Invoice 2041"}}
+      ]
+    },
+    {
+      "name": "colour_blocks",
+      "image": "examples/image-segmentation/data/photos/image_2.png",
+      "candidates": [[133, 233, 444, 700], [578, 200, 712, 802], [778, 300, 868, 702]],
+      "prompts": [
+        {"instruction": "选出蓝色矩形，其余候选不要选。label 写 blue。",
+         "expected": {"r3": "blue"}},
+        {"instruction": "选出圆形物体，其余候选不要选。label 写 circle。",
+         "expected": {"r1": "circle"}}
+      ]
+    }
+  ],
+  "rework_case": {
+    "instruction": "判断每个候选区域的形状，每个候选都要选。label 写形状名称：中空的方形写 hollow square，三角形写 triangle，分成两块的矩形写 two rectangles。",
+    "wrong_output": {"items": [
+      {"region_id": "r1", "label": "triangle"},
+      {"region_id": "r2", "label": "hollow square"},
+      {"region_id": "r3", "label": "two rectangles"}
+    ]},
+    "expected": {"r1": "hollow square", "r2": "two rectangles", "r3": "triangle"}
+  }
+}

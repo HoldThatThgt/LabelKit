@@ -49,6 +49,7 @@ from labelkit.common.errors import (
     InternalError,
     LabelKitError,
 )
+from labelkit.common.contracts.regions import project_regions
 from labelkit.common.contracts.sequence_capacity import member_key
 from labelkit.common.contracts.types import CapacityCut, PipelineItem, Record, StageError
 from labelkit.common.inference.schema_engine import SchemaEngine, _thaw_json
@@ -482,12 +483,15 @@ class Emitter:
     def _assemble_meta(self, item: PipelineItem, batch_no: int) -> dict:
         """装配 §6.3 的 `_meta` 对象——顶层键恒在场，关闭的阶段取 null。
 
+        唯一例外是 v1.22 图片模式的 `regions`（§9.1 第一个顶层条件键）：只有带候选的信封
+        才写，键位在 `stream` 与 `scores` 之间；非图片行不出现，因此逐字节不变。
+
         :param item: 该行的信封。
         :param batch_no: 批号。
         :returns: 顶层键序冻结的 `_meta` 对象。
         """
         rec = item.record
-        return {
+        meta = {
             "id": rec.id,
             "run": {
                 "tool": TOOL_VERSION,
@@ -500,6 +504,10 @@ class Emitter:
             # v1.8 恒在场键（§9.1）：segment 关闭时取 null；位置在 source 与
             # scores 之间，与链序一致。
             "stream": self._stream_block(item),
+        }
+        if item.regions is not None:
+            meta["regions"] = project_regions(item.regions)
+        meta.update({
             "scores": self._scores_block(item, batch_no),
             "dedup": {"kind": item.dedup.kind} if item.dedup is not None else None,
             # v1.7 恒在场键（§9.1）：信封没带分类时取 null（classify 关闭，或根本
@@ -513,7 +521,8 @@ class Emitter:
             ),
             "annotation": self._annotation_block(item),
             "verification": self._verification_block(item),
-        }
+        })
+        return meta
 
     def _rubric_selector(self) -> str:
         """`_meta.run.rubric` 的取值。
@@ -527,7 +536,7 @@ class Emitter:
             return sel
         # "" 本应已被 M1 解析掉；此处镜像 loader 的解析规则（v1.8 S29：流模式把空
         # 选择子解析成轨迹准则，两种模态皆然。
-        if self._cfg.segment.enabled:
+        if self._cfg.segment.sequence_resolved:
             return "default:trajectory"
         return f"default:{self._cfg.run.modality}"
 
@@ -610,7 +619,7 @@ class Emitter:
         :returns: stream 块；非流模式或非序列记录时为 None。
         """
         rec = item.record
-        if not self._cfg.segment.enabled or rec.kind != "sequence":
+        if not self._cfg.segment.sequence_resolved or rec.kind != "sequence":
             return None
         members = rec.members
         block: dict = {"episode_id": rec.id}
@@ -749,7 +758,7 @@ class Emitter:
         if ver is None:
             return None
         block: dict = {"verdict": ver.verdict, "rounds": ver.rounds}
-        if self._cfg.segment.enabled:
+        if self._cfg.segment.sequence_resolved:
             # v1.8（§9.1）：流模式带恒在场的 defects 键（无缺陷时为 []）；非流模式
             # 的审校块永不带它。
             block["defects"] = list(ver.defects)
@@ -1555,9 +1564,10 @@ def _step_row(transition, stitch_on: bool) -> dict:
 def _raw_payload(rec: Record) -> Mapping:
     """记录内容载荷。
 
-    text 模态 → Record.raw；UI 模态 → 序列化树 + 图片路径；v1.8 序列记录
-    （S25，§9.2）→ 成员 id/来源引用（kind="single" 保持冻结的单记录形态）。由
-    annotate 关闭时的主输出与 rejects 的 `full` 档共用（§9.1/§9.2）。
+    text 模态 → Record.raw；UI 模态 → 序列化树 + 图片路径；v1.22 图片模式 → 图片路径与
+    可选的伴随文件路径，不含 ui_tree，也不内联伴随字节；v1.8 序列记录（S25，§9.2）→
+    成员 id/来源引用（kind="single" 保持冻结的单记录形态）。由 annotate 关闭时的主输出
+    与 rejects 的 `full` 档共用（§9.1/§9.2）。
 
     :param rec: 待取载荷的记录。
     :returns: 该记录的内容载荷对象。
@@ -1570,6 +1580,11 @@ def _raw_payload(rec: Record) -> Mapping:
         }
     if rec.modality == "text":
         return rec.raw or {}
+    if rec.image_sha256 is not None:               # 只有图片模式的 M2 写这个字段（§4.3）
+        payload = {"image_path": str(rec.image.path)}
+        if rec.companion_path is not None:
+            payload["companion_path"] = rec.companion_path
+        return payload
     return {
         "ui_tree": rec.ui_tree.serialize() if rec.ui_tree is not None else "",
         "image_path": str(rec.image.path) if rec.image is not None else "",

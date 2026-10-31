@@ -703,7 +703,7 @@ def build(cfg, stages, records=None, *, ingestor=None, llm=None, schema_engine=N
     emitter = FakeEmitter(cfg)
     if ingestor is None and cfg.run.mode == "process":
         ingestor = FakeIngestor(records or [])
-    if cfg.segment.enabled:
+    if cfg.segment.sequence_resolved:
         stages = [SessionStageProbe(stage) if stage.name == "dedup" else stage for stage in stages]
     orch = ProcessWorkflow(cfg, stages, ingestor, emitter,
                         services(metrics, llm, schema_engine))
@@ -1845,7 +1845,7 @@ def stream_counts_invariant(counts):
 
 def stream_cfg(tmp_path, **kw):
     """make_cfg with segment enabled (defaults: hybrid strategy, window 20)."""
-    kw.setdefault("segment", SegmentConfig(enabled=True))
+    kw.setdefault("segment", SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     return make_cfg(tmp_path, **kw)
 
 
@@ -2276,7 +2276,7 @@ async def test_dry_run_stream_estimate_formulas_and_note(tmp_path, capsys):
     count comes from the exact next-fit packing simulation; the lower-bound
     note prints for the LLM-refining strategies."""
     cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
-                     segment=SegmentConfig(enabled=True, strategy="hybrid",
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid",
                                            window=20),
                      extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -2300,7 +2300,7 @@ async def test_dry_run_stream_rules_strategy_zero_segment_calls(tmp_path, capsys
     """strategy='rules' costs zero segment calls and prints no lower-bound
     note (episodes == sessions exactly under rules)."""
     cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
-                     segment=SegmentConfig(enabled=True, strategy="rules"))
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
     orch, _, _, _ = build(cfg, [], ingestor=ingestor)
     await orch.run()
@@ -2534,7 +2534,7 @@ async def test_dry_run_stitch_calls_formula_and_unconditional_line(tmp_path, cap
     """T16 estimate: stitch_calls = len(session_lens) × votes × (2 if repass
     else 1) over the episodes ≈ sessions lower-bound base; counted into total."""
     cfg = stitch_stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
-                            segment=SegmentConfig(enabled=True, strategy="rules"),
+                            segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                             stitch=StitchConfig(enabled=True, votes=3,
                                                 repass=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -2548,7 +2548,7 @@ async def test_dry_run_stitch_calls_formula_and_unconditional_line(tmp_path, cap
 
     # repass off halves the estimate; votes default 1
     cfg2 = stitch_stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
-                             segment=SegmentConfig(enabled=True, strategy="rules"),
+                             segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                              stitch=StitchConfig(enabled=True, repass=False))
     orch2, _, _, _ = build(cfg2, [], ingestor=FakeSessionIngestor(session_lens=(21, 5)))
     await orch2.run()
@@ -2707,7 +2707,7 @@ def test_estimate_run_stream_next_fit_exactness(tmp_path):
     """S22 numbers via the pure function (ported from the dry-run stderr test):
     exact next-fit batches, segment/extract formulas, episodes ≈ sessions."""
     cfg = stream_cfg(tmp_path, batch_size=8, annotate=True,
-                     segment=SegmentConfig(enabled=True, strategy="hybrid",
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid",
                                            window=20),
                      extract=ExtractConfig(enabled=True))
     est = estimate_run(cfg, SimpleNamespace(estimated_records=26,
@@ -2723,14 +2723,14 @@ def test_estimate_run_stream_next_fit_exactness(tmp_path):
 def test_estimate_run_stitch_votes_and_repass_formula(tmp_path):
     """T16: stitch_calls = len(session_lens) × votes × (2 if repass else 1)."""
     cfg = stitch_stream_cfg(tmp_path, batch_size=8, annotate=True,
-                            segment=SegmentConfig(enabled=True, strategy="rules"),
+                            segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                             stitch=StitchConfig(enabled=True, votes=3,
                                                 repass=True))
     plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
     assert estimate_run(cfg, plan)["stitch_calls"] == 12
 
     cfg2 = stitch_stream_cfg(tmp_path, batch_size=8, annotate=True,
-                             segment=SegmentConfig(enabled=True, strategy="rules"),
+                             segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                              stitch=StitchConfig(enabled=True, repass=False))
     assert estimate_run(cfg2, plan)["stitch_calls"] == 2
 
@@ -2742,7 +2742,7 @@ def test_estimate_run_frame_keys_formula_and_gating(tmp_path):
     冻结键序（_EST_KEYS）含两新键。"""
     plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
     cfg = stream_cfg(tmp_path, batch_size=8, annotate=True,
-                     segment=SegmentConfig(enabled=True, strategy="rules"),
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                      frame_classify=frame_classify_cfg(),
                      frame_annotate=frame_annotate_cfg())
     est = estimate_run(cfg, plan)
@@ -2754,7 +2754,7 @@ def test_estimate_run_frame_keys_formula_and_gating(tmp_path):
 
     # 单开关：另一键归零
     cfg_c = stream_cfg(tmp_path, batch_size=8, annotate=True,
-                       segment=SegmentConfig(enabled=True, strategy="rules"),
+                       segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                        frame_classify=frame_classify_cfg())
     est_c = estimate_run(cfg_c, plan)
     assert est_c["frame_classify_calls"] == 26
@@ -2762,7 +2762,7 @@ def test_estimate_run_frame_keys_formula_and_gating(tmp_path):
 
     # 全关（默认）⇒ 两键恒 0，total 与 v1.11 数值一致
     cfg_off = stream_cfg(tmp_path, batch_size=8, annotate=True,
-                         segment=SegmentConfig(enabled=True, strategy="rules"))
+                         segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"))
     est_off = estimate_run(cfg_off, plan)
     assert est_off["frame_classify_calls"] == 0
     assert est_off["frame_annotate_calls"] == 0
@@ -2772,7 +2772,7 @@ def test_estimate_run_frame_keys_formula_and_gating(tmp_path):
 async def test_dry_run_frame_calls_printed_with_switches_on(tmp_path, capsys):
     """v1.12：帧开关开启时估算行按冻结键序携带两键的帧总数上界，并计入 total。"""
     cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
-                     segment=SegmentConfig(enabled=True, strategy="rules"),
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                      frame_classify=frame_classify_cfg(),
                      frame_annotate=frame_annotate_cfg())
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -3209,7 +3209,7 @@ def budget_stream_cfg(tmp_path, context_window: int, **kw):
     context="", text modality (vision_resolved False) → est_static = 484+0+8
     (the V22 full-scaffolding segment constant), per_frame = 400+128 →
     w_min = (input_budget − 492) // 528."""
-    kw.setdefault("segment", SegmentConfig(enabled=True, strategy="hybrid",
+    kw.setdefault("segment", SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid",
                                            window=20))
     cfg = stream_cfg(tmp_path, **kw)
     return replace(cfg, llm_profiles={"default": budget_profile(context_window)})
@@ -3225,7 +3225,7 @@ def test_estimate_run_segment_calls_budget_two_state(tmp_path):
     reproduces the budget-off dict EXACTLY."""
     plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
     base = stream_cfg(tmp_path, batch_size=8, annotate=True,
-                      segment=SegmentConfig(enabled=True, strategy="hybrid",
+                      segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid",
                                             window=20),
                       extract=ExtractConfig(enabled=True))
     off = estimate_run(base, plan)                 # anchor (asserted above)
@@ -3248,7 +3248,7 @@ def test_estimate_run_rules_strategy_ignores_budget(tmp_path):
     under a tiny declared window (the L=1/rules zero-count gate precedes the
     w_eff clamp)."""
     cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, annotate=True,
-                            segment=SegmentConfig(enabled=True,
+                            segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True,
                                                   strategy="rules"))
     est = estimate_run(cfg, SimpleNamespace(estimated_records=26,
                                             session_lens=(21, 5)))

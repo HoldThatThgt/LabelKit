@@ -159,7 +159,7 @@ def _finalize_renderers():
 
 
 def test_account_line_nine_states_with_stream_stitch(_finalize_renderers):
-    cfg = _cfg(RICH, segment=SegmentConfig(enabled=True),
+    cfg = _cfg(RICH, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                stitch=StitchConfig(enabled=True))
     renderer, _ = _rich_renderer(cfg, counters=lambda: {"counts.threads": 5})
     _finalize_renderers.append(renderer)
@@ -332,7 +332,7 @@ def test_stage_board_sums_frame_keys_into_classify_and_annotate(_finalize_render
     """v1.12：段棋盘分母＝多键求和——classify 分母 = classify_calls +
     frame_classify_calls，annotate 同理；单键段（quality）行为不变；帧键缺位
     的估算字典退回单键分母（v1.10 行为）。"""
-    cfg = _cfg(RICH, segment=SegmentConfig(enabled=True),
+    cfg = _cfg(RICH, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                classify=ClassifyConfig(enabled=True))
     renderer, _ = _rich_renderer(cfg)
     _finalize_renderers.append(renderer)
@@ -1151,7 +1151,7 @@ def test_dry_run_rich_stream_note_matches_the_plain_wording(_finalize_renderers)
     """U13：rich 估算面的第二条注记与 plain 路径**同文**——流模式下游按
     episodes≈sessions 报下界（LLM 边界精化只会增加段数，spec 3.10.3 时序流行）。"""
     cfg = _cfg(RICH, dry_run=True,
-               segment=SegmentConfig(enabled=True, strategy="hybrid"))
+               segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid"))
     renderer, buf = _rich_renderer(cfg)
     _finalize_renderers.append(renderer)
     renderer.on_event(_ev("run.start"))

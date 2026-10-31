@@ -38,6 +38,7 @@ from labelkit.common.config._temporal import (
     project_temporal_instance,
     resolve_frame_time_values,
 )
+from labelkit.common.config._segment_image import image_mode
 from labelkit.common.config.model import ResolvedConfig, StreamConfig, TimeBindingSpec
 from labelkit.common.errors import InputError
 from labelkit.common.contracts.types import ImageRef, Record, RecordRef, UINode, UITree
@@ -319,14 +320,15 @@ class IngestPlan:
     files: tuple[str, ...]                     # 文本：.jsonl 文件（按文件名字典序）；
                                                # UI：全部命中文件，每对先树后图、按 index
                                                # 升序。路径相对 run.input（即
-                                               # RecordRef.source_file）
-    pairs: tuple[tuple[int, str, str], ...]    # UI 配对表（spec 3.2.3 配对表）：
-                                               # (index, 树路径, 图路径)，按 index 升序；
-                                               # 文本模态恒为 ()
+                                               # RecordRef.source_file）；v1.22 图片模式：
+                                               # 伴随文件（若有）后图片
+    pairs: tuple[tuple[int, str | None, str], ...]  # UI 配对表（spec 3.2.3 配对表）：
+                                               # (index, 树路径, 图路径)，按 index 升序；文本
+                                               # 模态恒为 ()；图片模式：(index, 伴随文件 | None, 图片)
     estimated_records: int                     # 文本：总行数（廉价计数）；UI：len(pairs)
     session_lens: tuple[int, ...] = ()         # v1.8（S23）：供 dry-run next-fit 装箱用的
                                                # 会话干跑长度；estimate=False 或
-                                               # segment.enabled=False 时为 ()
+                                               # segment.sequence_resolved=False 时为 ()
 
 
 @dataclass
@@ -344,6 +346,8 @@ class IngestReport:
                                                # 时间戳解析失败；是 bad_input 的子集，S20）
     # 坏数据位置表：{"file": str, "line_no": int|None, "index": int|None, "reason": str}
     bad_locations: list[dict] = field(default_factory=list)
+    ignored_files: int = 0                     # v1.22 仅图片模式：既非图片也非已声明伴随文件的
+                                               # 文件数；不计入 scanned、bad_input 与守恒式
 
 
 @dataclass(frozen=True)
@@ -359,7 +363,7 @@ class Session:
 @dataclass(frozen=True)
 class _UIScan:
     """UI 全量扫描结果（内部）：命中配对 + 两类异常，全部按 index 组织。"""
-    pairs: tuple[tuple[int, str, str], ...]            # 命中配对，按 index 升序
+    pairs: tuple[tuple[int, str | None, str], ...]     # 命中配对，按 index 升序
     conflicts: tuple[tuple[int, tuple[str, ...]], ...]  # (index, 冲突文件组)，按 index 升序
     missing: tuple[tuple[int, str, str], ...]           # (index, 在场侧 "tree"|"image", 文件)
 
@@ -576,7 +580,7 @@ class Ingestor:
         跳过文本模态的行计数（该计数会读完每一个输入字节）—— 预扫描只需要快速
         失败检查，不需要预估值，也不应把输入 I/O 翻倍。
 
-        v1.8（S23）：segment.enabled 且 estimate=True 时，计划另带
+        v1.8（S23）：segment.sequence_resolved 且 estimate=True 时，计划另带
         ``session_lens`` —— 在同一遍读取（文本）或配对表（UI，零额外 I/O）上做
         会话干跑。纯计数彩排：不产 Record、不发事件、不改账本；坏行与乱序记录
         的跳过方式与真实 skip 策略运行完全一致。
@@ -586,7 +590,10 @@ class Ingestor:
         @raises InputError run.input 缺失/不可读，或 UI 配对异常命中 "fail" 策略
         """
         root = self._require_root()
-        stream_mode = self._cfg.segment.enabled
+        if image_mode(self._cfg.segment):
+            from labelkit.operators.ingest_image import scan_image_plan
+            return scan_image_plan(self, root)
+        stream_mode = self._cfg.segment.sequence_resolved
         if self._cfg.run.modality == "text":
             return self._scan_text(root, estimate=estimate, stream_mode=stream_mode)
         return self._scan_ui_plan(root, estimate=estimate, stream_mode=stream_mode)
@@ -596,7 +603,7 @@ class Ingestor:
 
         @param root run.input 根路径
         @param estimate 是否计算预估记录数
-        @param stream_mode 是否 stream 模式（segment.enabled）
+        @param stream_mode 是否 stream 模式（segment.sequence_resolved）
         @return 扫描计划 IngestPlan
         @raises InputError 输入文件不可读
         """
@@ -641,7 +648,7 @@ class Ingestor:
 
         @param root run.input 根目录
         @param estimate 是否计算会话干跑长度
-        @param stream_mode 是否 stream 模式（segment.enabled）
+        @param stream_mode 是否 stream 模式（segment.sequence_resolved）
         @return 扫描计划 IngestPlan
         @raises InputError 配对异常命中 "fail" 策略
         """
@@ -703,6 +710,9 @@ class Ingestor:
         root = self._require_root()
         if self._cfg.run.modality == "text":
             yield from self._text_records(root)
+        elif image_mode(self._cfg.segment):
+            from labelkit.operators.ingest_image import image_records
+            yield from image_records(self, root)
         else:
             yield from self._ui_records(root)
         if self._report.ingested == 0:

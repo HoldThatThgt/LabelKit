@@ -5,6 +5,8 @@
 
 > **2026-08-14 整改修订注记**：全库代码规则整改（spec §1.6 同日条目 / CONTRACTS §12 第 34 条）对本文的**决策与规格零改动**——本文保留为历史裁决记录。仅两处口径随代码更新：① 生产代码的注释与 docstring 为中文，日志/报错/CLI 输出为英文（LLM 提示词模板与 spec 冻结的输出数据仍为中文原样）；② 若本文引用了 `build_annotate_prompt` / `annotate_record` / `build_verify_prompt` / `complete_validated` / `render_thread_card` / `Orchestrator` 的「末位可选形参」调用形，这些取值现已收拢为参数对象 `AnnotatePromptOptions` / `VerifyPromptOptions` / `CallScope` / `ThreadCard` / `RunServices`（字段名与语义逐项不变）。
 
+> **2026-10-31 修订注记（v1.22）**：`segment.mode` 拆分后，本文的「stream 模式」一律指 `segment.sequence_resolved = true`（`segment.enabled ∧ segment.mode == "sequence"`），流语义判断改读该解析产物，行为零改动；`segment.enabled` 只在注明时指开关本身。`segment.mode = "image"` 不走本文的会话、窗口与 `_meta.stream` 语义，见 `SPEC-image-region-segmentation.md`。
+
 ---
 
 ## 1. 可行性结论（fan-out 审查汇总）
@@ -59,7 +61,7 @@
 | S26 | 裁决·分段降格留痕三件套 | segment.on_error="keep" 留痕落点未禁写 item.errors（与裁决·fallback 留痕不写 errors 同型的归因污染） | 留痕三件套 = **`_meta.stream.degraded = {kind:"segmentation_invalid", windows_failed:k}`** + EV_ERROR 事件 + 计数器 `segment.failures`；item.errors 仅 on_error="fail" 路径写 |
 | S27 | 裁决·数据键脱敏剥除 | `extract.step` 事件 payload 的 target/value 是输入数据派生（可能含用户键入文本），现行脱敏全档放行——违反 refs 档「无输入数据内容」红线 | obslog 增 **`_DATA_KEYS = {"target","value"}`：none/refs 档剥除**；`"description"` 加入 `_FREE_TEXT_KEYS`（none 档剥除）。事件分级：extract.step none={episode_id,index,action_type}、refs=+description、excerpt=+target/value；segment.boundary none=结构字段（session_id/window/逐帧 relation）、refs=+reason（键已在集合）；三事件 stderr 镜像均 trace-only |
 | S28 | 裁决·关键帧数上下界联动 | sequence_frames 无下界（k=1 除零）、上界与图像尺寸联动缺失（Anthropic >20 图单图 >2000px = 400 硬拒非缩放；现默认 max_image_px=2048 恰撞拒） | M1 校验：**`2 ≤ sequence_frames ≤ 100`**（>100 CONFIG_ERROR）；**`sequence_frames > 20` 且引用 profile `max_image_px > 2000` ⇒ WARN**（指引改 2000 或降帧）；降采样公式 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（n≤k 取全量；纯整数零 rng，首末恒含，n>k 时严格递增无重复）；20 图阈值按请求内全部 image block 计。openai_compatible 不设独立上限（官方 1500 图/512MB；网关差异入手册 + probe 指引） |
-| S29 | 裁决·流模式默认轨迹准则 | stream 模式 rubric 空串默认按模态解析会静默产出无意义分数（default:ui 全是逐帧视觉判据、序列打分无图） | **`segment.enabled=true` 时 `quality.rubric == ""` 解析为 `"default:trajectory"`**（两模态一致；用户显式选择器恒优先；按类视图经 base selector 自动继承）；rubric 文本模态中立、不预设 steps 在场（extract 关闭时「步骤」读作「帧间变化」，M1 对该组合发 warning 指引）；TRM 为 1–5 五级，本表 0–5 六级是 LabelKit 家规改制（spec 背书表注明）；目的性/噪声残留两维无 TRM 原文背书（分别源自 Coherence 拆分与 RPA 噪声处理），背书表分开挂 |
+| S29 | 裁决·流模式默认轨迹准则 | stream 模式 rubric 空串默认按模态解析会静默产出无意义分数（default:ui 全是逐帧视觉判据、序列打分无图） | **`segment.sequence_resolved=true` 时 `quality.rubric == ""` 解析为 `"default:trajectory"`**（两模态一致；用户显式选择器恒优先；按类视图经 base selector 自动继承）；rubric 文本模态中立、不预设 steps 在场（extract 关闭时「步骤」读作「帧间变化」，M1 对该组合发 warning 指引）；TRM 为 1–5 五级，本表 0–5 六级是 LabelKit 家规改制（spec 背书表注明）；目的性/噪声残留两维无 TRM 原文背书（分别源自 Coherence 拆分与 RPA 噪声处理），背书表分开挂 |
 | S30 | 裁决·引用集四处与视觉表 | 三处 profile 引用集实为四处（漏 `_check_llm_ref`）；rules 策略零调用不应强制配键 | **segment.llm 仅 `strategy ∈ {llm, hybrid}` 时**入密钥解析/视觉必需（仅 use_vision）/probe/存在性四处引用集；extract.llm 恒入四处且恒入 vision_users；stream 模式视觉必需集逐阶段表：classify ✓（首帧图）、annotate ✓（多图）、verify ✓（首末帧图）、extract ✓（恒）、segment（仅 use_vision）、**quality ✗（序列打分纯文本，放宽）** ［v1.11 交叉注：本行「视觉必需（仅 use_vision）」条件与逐阶段表的 segment 分支已被裁决·视觉能力自动推导、裁决·视觉校验集删分段支与裁决·贫瘠指引改选 profile 修订——use_vision 键移除、segment 从「要求视觉」变为「适配视觉」（能力推导 `vision_resolved`），视觉必需集删 segment 分支，见 `SPEC-context-budget.md`；历史记录本体不改写］ |
 | S31 | 裁决·手术观测面钉死 | verify 弃帧（收缩）与手术观测面：归因、事件、报表落点未定义 | 收缩弃帧 rejects 行 **stage="verify"、reason="off_task_member"**（duck 标，raw_last_output 先例）；defects 摘要入 `verify.verdict` 事件 payload（受 content 分级）；计数器 `verify.membership_repairs`/`verify.boundary_flags`/`verify.defects.<kind>` → report.stream.verify 子块；`Transition.index` 手术后**重编号**（不变量 transitions=members−1 恒真）+ `detail.reseamed=true` 溯源；多评审团 defects = 投 fail 的 judge 并集、按 (kind 枚举序, position, members) 确定性去重排序，同成员互斥手术取先序 |
 | S32 | 裁决·保留滑窗修订判据 | 滑窗 vs 整段单调用（GUIDE 99.4% 段可用率）；Def-DTS 引用精度；GEBD 措辞 | v1 保留 hybrid 滑窗（window ≥ 会话长时天然退化为整段单调用；GUIDE 证据入 §1.5 建议可调大 window）；Def-DTS 引用修正为「**半结构（仅双向概括）比裸问题差、完整三步最优；边界信号清晰场景裸判决可胜全套**」+ 5 关系词表按域定制合法（Def-DTS 自身逐数据集改池先例）+ 判据模板明文「**相关但无实体延续的新流程 = context_switch（边界）**」与「会话首帧恒为段首」；GEBD 措辞降级为「中等共识可达」（5 人多评协议数据）；「extract 先行 + 动作序列上分段」次序（同行主流）列演进候选，以成本权衡（dedup 前置节省 vs 分段证据质量）而非「环形依赖」论证 ［v1.11 交叉注：「window ≥ 会话长时天然退化为整段单调用 / 长会话建议调大 window」叙事已被裁决·动态装填静态护栏与裁决·估算报上界面板零改修订——window 降级为纯上限、实际装填按预算贪心切窗，整段单调用以预算装得下为前提（裁决·窗口估算公式修正的公式随之改 w_min 上界），见 `SPEC-context-budget.md`；历史记录本体不改写］ |
@@ -239,11 +241,11 @@ flowchart TD
 
 ### 3.6 M1 组合约束与校验（spec §3.1.4 / §2.3.1 增量）
 
-- `segment.enabled` 要求：`run.mode="process"` ∧ `generate.enabled=false`（含 generate_only 传递闭合）∧ `annotate.enabled=true`（提案 §7 开放问题「stream ⇒ annotate 必开」）。
-- `extract.enabled` 要求 `segment.enabled` ∧ `run.modality="ui"`。
+- `segment.enabled`（指开关本身，两种 `segment.mode` 都适用）要求：`run.mode="process"` ∧ `generate.enabled=false`（含 generate_only 传递闭合）；`segment.sequence_resolved` 另要求 `annotate.enabled=true`（提案 §7 开放问题「stream ⇒ annotate 必开」）。
+- `extract.enabled` 要求 `segment.sequence_resolved` ∧ `run.modality="ui"`。
 - `stream.gap_s`/`session_max_span_s` 要求 `order_by="meta:*"`；`order_by="meta:*"` 仅文本模态；`stream.key` 元素 = `"meta:<field>"`（仅文本）| `"source_dir"`。
 - `segment.window ≥ 2`；`2 ≤ annotate.sequence_frames ≤ 100`；`sequence_frames>20 ∧ max_image_px>2000` ⇒ WARN（裁决·关键帧数上下界联动）；`session_max_len > run.batch_size` ⇒ WARN（裁决·顺序装箱单开口箱）。
-- no-op warnings（裁决·关开关留配置仅警告家族）：`[stream]`/`[segment]`/`[extract]` 在场而 segment.enabled=false；`strategy="rules"` ∧ noise_filter=true；`sequence_frames` 显式设置而非 stream；`quality.mode` 任意 + extract.enabled=false 时 trajectory rubric 组合提示。
+- no-op warnings（裁决·关开关留配置仅警告家族）：`[stream]`/`[segment]`/`[extract]` 在场而 segment.enabled=false（此处仅指开关本身）；`strategy="rules"` ∧ noise_filter=true；`sequence_frames` 显式设置而非 stream；`quality.mode` 任意 + extract.enabled=false 时 trajectory rubric 组合提示。
 - 引用集四处与视觉必需逐阶段表（裁决·引用集四处与视觉表）；`[class.<name>.extract]` 白名单（仅 instruction 键）；segment 不入白名单（链序因果：segment 在 classify 前，类标签不存在——spec 白名单表注明）。
 - rubric：selector 枚举三值 + `""` 的 stream 解析（裁决·流模式默认轨迹准则）；`default_trajectory.toml` 包数据。
 
@@ -253,13 +255,13 @@ flowchart TD
 
 **状态记账**：post-emit tally 增 absorbed/dropped_noise；failed 兜底公式扩展：
 `failed = max(len(batch) − emitted − dropped_dup − dropped_lowq − dropped_verify − absorbed − dropped_noise, 0)`。
-`batch.end` payload 增 `episodes`/`absorbed`/`dropped_noise`（仅 segment 启用时携带，裁决·批事件增 fanout 字段形制）。stderr 摘要/进度行**不增键**（fanout 先例；报表可见）。
+`batch.end` payload 增 `episodes`/`absorbed`/`dropped_noise`（仅 `segment.sequence_resolved` 时携带，裁决·批事件增 fanout 字段形制）。stderr 摘要/进度行**不增键**（fanout 先例；报表可见）。
 
 **守恒恒等式**（spec §6.4）：
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed = scanned + generated + fanout + episodes`；
 熔断**或中断（stream 模式，裁决·中断残差入守恒）**时左侧另加 `unprocessed`（残差公式同步扩展）。
 
-**M11**：absorbed 第三路由（不写主输出、不写 rejects、仅计数）；`_reject_stage_reason` 增 dropped_noise 分支（segment/noise、segment/below_min_len、verify/off_task_member 按 duck 标分流）；`_meta` 增恒在键 `"stream"`（位置：source 之后、scores 之前——链序镜像），未启用 = null，结构：
+**M11**：absorbed 第三路由（不写主输出、不写 rejects、仅计数）；`_reject_stage_reason` 增 dropped_noise 分支（segment/noise、segment/below_min_len、verify/off_task_member 按 duck 标分流）；`_meta` 增恒在键 `"stream"`（位置：source 之后、scores 之前——链序镜像），`segment.sequence_resolved` 为假 = null，结构：
 
 ```
 "stream": {"episode_id", "session_id", "order_span": [first, last], "member_count",
@@ -270,7 +272,7 @@ flowchart TD
 ```
 `_meta.verification` 在 stream 模式增 `defects` 键（恒在，无缺陷 = []）。rejects full 序列载荷（裁决·序列拒收载荷形态）。
 
-**report**：counts 增 episodes/absorbed/dropped_noise（segment 启用时）；新 `stream` 节：
+**report**：counts 增 episodes/absorbed/dropped_noise（`segment.sequence_resolved` 时）；新 `stream` 节：
 
 ```
 "stream": {"sessions", "episodes", "mean_episode_len", "absorbed", "dropped_noise",
@@ -296,7 +298,7 @@ sessions 数据源 = IngestReport（M2 属主）。
 ### 3.10 配置增量总表（spec §5.2）
 
 ```toml
-[stream]                          # 输入侧声明（M2 消费；segment.enabled=false 时在场 ⇒ warning）
+[stream]                          # 输入侧声明（M2 消费；segment.enabled=false（仅指开关本身）时在场 ⇒ warning）
 order_by = "input_order"          # "input_order" | "meta:<field>"（仅文本模态）
 on_disorder = "skip"              # "skip"（计 bad_input+disorder）| "fail"
 key = []                          # ["meta:<field>"（文本）| "source_dir"]；键变即断
@@ -305,8 +307,9 @@ gap_steps = 0                     # 序号差断开（0=不启用）；与 gap_s
 session_max_len = 200             # 硬上限（帧）；> batch_size ⇒ M1 WARN
 session_max_span_s = 0            # 仅 meta:*（0=不启用）
 
-[segment]                         # M14（stream 模式总开关）
+[segment]                         # M14（enabled ∧ mode="sequence" 即 stream 模式，解析产物 sequence_resolved）
 enabled = false                   # 默认 false = 与 v1.7 行为逐字节一致
+mode = "sequence"                 # v1.22：enabled=true 时必填，无默认、无别名；"image" 见 SPEC-image-region-segmentation.md
 strategy = "hybrid"               # "rules" | "llm" | "hybrid"
 llm = "default"                   # 仅 strategy∈{llm,hybrid} 入引用集（S30）
 window = 20                       # ≥2；滑窗帧数/调用（重叠 1 帧）
@@ -318,7 +321,7 @@ context = ""                      # 可选域上下文；边界判据内置于�
 on_error = "keep"                 # "keep"（S26 留痕）| "fail"
 
 [extract]                         # M15（仅 UI 序列）
-enabled = false                   # 启用要求 segment.enabled ∧ modality="ui"
+enabled = false                   # 启用要求 segment.sequence_resolved ∧ modality="ui"
 llm = "default"                   # 恒入引用集 + vision_users
 instruction = ""                  # [class.<name>.extract] 可覆盖（白名单仅此键）
 include_diff = true               # [树变更摘要] 注入开关（S14）
@@ -436,7 +439,7 @@ sequence_frames = 20              # 序列标注单请求最大帧数；[2,100]�
 | 7 | examples/stream fixture + 集成测试 + 四存量 example 回归重跑 | integration 全绿；存量输出与 v1.7 逐字段 diff 仅差 `stream: null` |
 | 8 | 手册（25 章新 + 20 章增改 + 5 章重同步）+ CLAUDE/AGENTS/README | 手册样例块与真实运行产物逐字一致 |
 
-**验收标准**（观测定义）：① examples/stream 真实运行——噪声帧进 rejects(reason=noise)、两任务各成一 episode、`_meta.stream.steps` 与人工预期一致（trace 抽查）、任务标签落用户 Schema；② 守恒恒等式（含 episodes/absorbed/dropped_noise）成立、同 seed 重跑逐字节一致；③ `segment.enabled=false` 全量回归：四个存量 examples 输出与 v1.7 逐字段一致（`stream: null` 除外）；④ 25 帧 episode 的 sequence_frames=20 降采样真实端点调用成功；⑤ --strict/dry-run/熔断/中断交付语义符合 §3.7。
+**验收标准**（观测定义）：① examples/stream 真实运行——噪声帧进 rejects(reason=noise)、两任务各成一 episode、`_meta.stream.steps` 与人工预期一致（trace 抽查）、任务标签落用户 Schema；② 守恒恒等式（含 episodes/absorbed/dropped_noise）成立、同 seed 重跑逐字节一致；③ `segment.enabled=false`（仅指开关本身）全量回归：四个存量 examples 输出与 v1.7 逐字段一致（`stream: null` 除外）；④ 25 帧 episode 的 sequence_frames=20 降采样真实端点调用成功；⑤ --strict/dry-run/熔断/中断交付语义符合 §3.7。
 
 ## 7. 顺带记录与已知锐边
 

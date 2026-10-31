@@ -29,7 +29,9 @@ from labelkit.common.config._classviews import (
 from labelkit.common.config._collect import _Collector, _fmt
 from labelkit.common.config._postprocessing import (
     check_parked_postprocessor_references,
+    check_region_refs,
     compile_postprocessor_model,
+    region_ref_paths,
     project_postprocessor_examples,
     require_postprocessor,
     resolve_config_postprocessor,
@@ -39,6 +41,7 @@ from labelkit.common.config.generation import (
     parse_generation_config,
 )
 from labelkit.common.config._rubrics import _RubricSite, _check_pointwise_rubric, _resolve_rubric
+from labelkit.common.config._segment_image import check_segment_image, image_mode
 from labelkit.common.config._schemas import (
     _DryRun,
     _dryrun_fewshot,
@@ -95,12 +98,13 @@ class _Products:
     class_views: dict[str, ClassView] = field(default_factory=dict)          # 序列类视图
     frame_schema: dict | None = None                    # 帧级输出 Schema
     model_user_schema: object = None                    # 全局冻结模型 Schema
+    region_ref_paths: tuple[str, ...] = ()              # 全局 Schema 的 x-labelkit-region-ref 路径
     model_frame_schema: object = None                   # 帧级冻结模型 Schema
     frame_class_views: dict[str, FrameClassView] = field(default_factory=dict)  # 帧类视图
     eff_input: str | None = None                        # 生效输入路径(CLI > project, 绝对)
     eff_output: str | None = None                       # 生效输出路径(CLI > project, 绝对)
     hooks: dict[str, ResolvedHook] = field(default_factory=dict)
-                                                        # 键 = output/sample/state
+                                                        # 键 = output/sample/state/box_parser
     sequence_generation: SequenceGenerationConfig | None = None
                                                         # v1.18 sequence-only 解析产物
 
@@ -156,8 +160,8 @@ def _check_profile_refs(ctx: _LoadCtx) -> None:
     @param ctx 校验上下文
     """
     p, fp = ctx.p, ctx.fp
-    if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
-        # v1.8 S30: rules 策略零 LLM 调用——只有真正会拨号的策略才让 segment.llm 入集
+    if p.segment.llm_referenced:
+        # v1.8 S30 / v1.22: 只有真正会拨号的配置才让 segment.llm 入集
         _check_llm_ref(ctx, f"{fp}:[segment].llm", p.segment.llm)
     if p.stitch.enabled:
         # v1.9 T16/T17: 纯文本判定——启用即引用, 但永不加入下面的 vision 必需集
@@ -224,7 +228,7 @@ def _vision_users(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> dict[str, set[
     """
     p = ctx.p
     users: dict[str, set[str]] = {}
-    if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
+    if p.segment.llm_referenced:
         users.setdefault(p.segment.llm, set()).add("segment")
     if p.frame_classify.enabled:
         users.setdefault(p.frame_classify.llm, set()).add("frame.classify")
@@ -272,8 +276,8 @@ def _check_dedup_semantic(ctx: _LoadCtx) -> None:
     @param ctx 校验上下文
     """
     dedup = ctx.p.dedup
-    if not dedup.semantic:
-        return
+    if not dedup.semantic or image_mode(ctx.p.segment):
+        return      # 图片模式的语义层由 rule 78a 定向报错, 不再追加 embedding 要求
     if dedup.semantic_embedding is None:
         ctx.col.error(f"{ctx.fp}:[dedup].semantic_embedding: required when dedup.semantic = "
                       f"true, expected an [embedding.*] profile name from config.toml")
@@ -448,8 +452,8 @@ def _collect_referenced(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> set[str]
     """
     p = ctx.p
     referenced: set[str] = set()
-    if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
-        referenced.add(p.segment.llm)      # v1.8, S30 引用集要点②
+    if p.segment.llm_referenced:
+        referenced.add(p.segment.llm)      # v1.8, S30 引用集要点②; v1.22 rule 33
     if p.stitch.enabled:
         referenced.add(p.stitch.llm)       # v1.9, T17 引用集要点
     if p.classify.enabled:
@@ -536,6 +540,8 @@ def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
     dr.schema_ok = schema_ok
     products.user_schema = user_schema
     products.model_user_schema = compile_postprocessor_model(col, fp, "[output]", user_schema if schema_ok else None)
+    check_region_refs(col, fp, "[output]", user_schema if schema_ok else None, image_mode(p.segment))
+    products.region_ref_paths = region_ref_paths(user_schema if schema_ok else None)
     if p.annotate.enabled and not (p.classify.enabled or p.generate.form == "sequence"):
         require_postprocessor(col, fp, "[annotate]", user_schema, p.annotate.resolved_postprocessor)
     if dr.validator is not None and p.annotate.examples:
@@ -576,7 +582,7 @@ def _resolve_global_rubric(ctx: _LoadCtx, products: _Products) -> None:
     p = ctx.p
     if p.quality.rubric:
         selector = p.quality.rubric
-    elif p.segment.enabled or p.generate.form == "sequence":
+    elif p.segment.sequence_resolved or p.generate.form == "sequence":
         selector = "default:trajectory"
     else:
         selector = "default:ui" if ctx.modality == "ui" else "default:text"
@@ -667,7 +673,7 @@ def _check_classify_and_views(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
         bases=_ClassBases(quality=replace(p.quality, rubric=products.selector),
                           annotate=p.annotate, generate=p.generate,
                           verify=p.verify, extract=p.extract),
-        dryrun=products.dryrun)
+        dryrun=products.dryrun, image=image_mode(p.segment))
     products.class_views = _build_class_views(col, classify, p.class_raw, inputs)
     check_parked_postprocessor_references(col, fp, p.class_raw, "class", products.class_views)
     return ctx
@@ -679,7 +685,9 @@ def _check_stage_matrix(ctx: _LoadCtx) -> None:
     @param ctx 校验上下文
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
-    if not p.annotate.enabled and not p.quality.enabled:
+    # v1.22 D9: 图片模式写了 instruction 时 segment 阶段本身就是产出阶段, 允许只跑分割。
+    segment_produces = image_mode(p.segment) and p.segment.llm_referenced
+    if not p.annotate.enabled and not p.quality.enabled and not segment_produces:
         col.error(f"{fp}:[quality].enabled: quality and annotate must not both be disabled "
                   f"(at least one must be enabled, 2.3.1 constraint ①)")
     if p.verify.enabled and not p.annotate.enabled:
@@ -714,10 +722,17 @@ def _check_stage_switches(ctx: _LoadCtx) -> None:
             col.error(f"{fp}:[segment].enabled: segment.enabled = true and "
                       f"generate.enabled = true are mutually exclusive (stream mode does "
                       f"no generation)")
-        if not p.annotate.enabled:
+        if not p.annotate.enabled and p.segment.sequence_resolved:
             col.error(f"{fp}:[segment].enabled: segment.enabled = true requires "
                       f"annotate.enabled = true (constraint ⑭: episodes must be annotated "
                       f"into the user schema)")
+        elif image_mode(p.segment) and not p.annotate.enabled and not p.segment.llm_referenced:
+            # v1.22 D9 只放宽写了 instruction 的图片模式; D15 路径不调用模型, 不放宽。
+            col.error(f'{fp}:[segment].enabled: segment.mode = "image" without instruction '
+                      f"requires annotate.enabled = true (box_parser-only runs make no model "
+                      f"call)")
+    # 下面的前置条件语义都是 sequence_resolved: 开关开启但缺 mode 只报 rule 72,
+    # 图片模式只报 rule 76(check_segment_image), 所以旧文本只在开关关闭时发出。
     if p.stitch.enabled and not p.segment.enabled:
         # v1.9 T17: stitch 只消费 segment 的产物
         col.error(f"{fp}:[stitch].enabled: stitch.enabled = true requires "
@@ -774,7 +789,7 @@ def _check_stream_keys(ctx: _LoadCtx) -> None:
         else:
             col.error(f'{fp}:[stream].key[{i}]: expected "meta:<field>" (text only) | '
                       f'"source_dir", got {_fmt(k)}')
-    if p.segment.window < 2:
+    if p.segment.window < 2 and not image_mode(p.segment):
         col.error(f"{fp}:[segment].window: expected an integer >= 2 (a sliding window must "
                   f"contain at least one adjacent frame pair), got {p.segment.window}")
 
@@ -852,9 +867,12 @@ def _check_stream_family(ctx: _LoadCtx, products: _Products) -> None:
     """
     _check_stage_switches(ctx)
     _check_stream_keys(ctx)
-    if ctx.p.segment.enabled:
+    segment = ctx.p.segment
+    if segment.enabled:
+        check_segment_image(ctx, products)
+    if segment.sequence_resolved:
         _warn_segment_on(ctx, products.selector)
-    else:
+    elif not segment.enabled:
         _warn_segment_off(ctx)
 
 
@@ -862,7 +880,7 @@ def _check_stream_family(ctx: _LoadCtx, products: _Products) -> None:
 
 
 def _check_frame_switches(ctx: _LoadCtx) -> None:
-    """约束·帧粒度要求流模式 + 两条定向探针 + meta_mode 护栏。
+    """约束·帧粒度要求流模式(图片模式的定向错误是 rule 76) + 两条定向探针 + meta_mode 护栏。
 
     @param ctx 校验上下文
     """
@@ -946,6 +964,7 @@ def _load_frame_annotate_schema(ctx: _LoadCtx, products: _Products) -> _FrameVie
     if fs_ok:
         products.frame_schema = fschema
         products.model_frame_schema = compile_postprocessor_model(col, fp, "[frame.annotate]", fschema)
+        check_region_refs(col, fp, "[frame.annotate]", fschema, False)
         fctx.validator = Draft202012Validator(fschema)
         if not (p.frame_classify.enabled or p.generate.form == "sequence"):
             require_postprocessor(col, fp, "[frame.annotate]", fschema, p.frame_annotate.resolved_postprocessor)
@@ -1068,14 +1087,26 @@ def _freeze_vision(ctx: _LoadCtx) -> _LoadCtx:
     p = ctx.p
     prof_seg = ctx.llm_profiles.get(p.segment.llm)
     segment = replace(p.segment, vision_resolved=(
-        ctx.modality == "ui" and p.segment.enabled
-        and p.segment.strategy in ("llm", "hybrid")
+        ctx.modality == "ui" and p.segment.llm_referenced
         and prof_seg is not None and prof_seg.supports_vision))
     prof_fc = ctx.llm_profiles.get(p.frame_classify.llm)
     frame_classify = replace(p.frame_classify, vision_resolved=(
         ctx.modality == "ui" and p.frame_classify.enabled
         and prof_fc is not None and prof_fc.supports_vision))
     return replace(ctx, p=replace(p, segment=segment, frame_classify=frame_classify))
+
+
+def _freeze_box_parser(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
+    """把 ``check_segment_image`` 解析出的钩子冻结进 ``segment.resolved_box_parser``。
+
+    @param ctx 校验上下文
+    @param products 产物累加器(读取 ``box_parser`` 钩子)
+    @return 冻结后的上下文
+    """
+    hook = products.hooks.get("box_parser")
+    if hook is None:
+        return ctx
+    return replace(ctx, p=replace(ctx.p, segment=replace(ctx.p.segment, resolved_box_parser=hook)))
 
 
 def _warn_segment_image_limit(ctx: _LoadCtx) -> None:
@@ -1106,6 +1137,10 @@ def _warn_undeclared_windows(ctx: _LoadCtx, products: _Products) -> None:
     for name in sorted(products.referenced):
         prof_r = ctx.llm_profiles.get(name)
         if prof_r is not None and prof_r.context_window == 0:
+            if image_mode(ctx.p.segment):
+                ctx.col.error(f'{ctx.fc}:[llm.{name}].context_window: segment.mode = "image" requires '
+                              "a positive deployment context window for every referenced model profile")
+                continue
             if ctx.p.segment.enabled:
                 ctx.col.error(f"{ctx.fc}:[llm.{name}].context_window: process sequences require a positive "
                               "deployment context window for every enabled model profile")
@@ -1119,7 +1154,7 @@ def _warn_undeclared_windows(ctx: _LoadCtx, products: _Products) -> None:
     if dedup.enabled and dedup.semantic and dedup.semantic_embedding in ctx.embedding_profiles:
         prof_e = ctx.embedding_profiles[dedup.semantic_embedding]
         if prof_e.context_window == 0:
-            if ctx.p.segment.enabled:
+            if ctx.p.segment.sequence_resolved:
                 ctx.col.error(f"{ctx.fc}:[embedding.{prof_e.name}].context_window: process sequences require "
                               "a positive deployment context window for semantic deduplication")
                 return
@@ -1174,7 +1209,11 @@ def _static_checks_prefix(ctx: _LoadCtx,
     """
     p = ctx.p
     checks: list[tuple[str, tuple, int]] = []
-    if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
+    if image_mode(p.segment) and p.segment.llm_referenced:
+        checks.append(("segment", (p.segment.llm,),
+                       budget.TEMPLATE_HEAD_TOKENS["segment_image"]
+                       + budget.est_text(p.segment.instruction)))
+    elif p.segment.sequence_resolved and p.segment.strategy in ("llm", "hybrid"):
         checks.append(("segment", (p.segment.llm,),
                        budget.TEMPLATE_HEAD_TOKENS["segment"]
                        + budget.est_text(p.segment.context)))
@@ -1554,6 +1593,7 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _collect_referenced_profiles(ctx, products)
     _check_stage_matrix(ctx)
     _check_stream_family(ctx, products)
+    ctx = _freeze_box_parser(ctx, products)
     _check_frame_family(ctx, products)
     ctx = _project_global_postprocessor_examples(ctx, products)
     _parse_sequence_generation(ctx, products)

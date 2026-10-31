@@ -180,7 +180,7 @@ def build_extract_prompt(prev: Record, curr: Record, cfg: "ResolvedConfig",
     if cfg.extract.include_diff:
         diff = tree_diff(prev.ui_tree, curr.ui_tree, cfg.dedup.bounds_quantize_px)
         tail_lines.append(f"{_LABEL_DIFF} {_diff_text(diff)}")
-    if cfg.run.mode == "process" and cfg.segment.enabled:
+    if cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         tail_lines.extend((f"[前一帧完整控件树]\n{record_evidence(prev)}",
                            f"[后一帧完整控件树]\n{record_evidence(curr)}"))
     else:
@@ -327,7 +327,7 @@ async def _extract_transition_outcome(prev: Record, curr: Record, index: int,
     prompt = build_extract_prompt(prev, curr, cfg, label)
     ids = (prev.id, curr.id)
     try:
-        if cfg.run.mode == "process" and cfg.segment.enabled:
+        if cfg.run.mode == "process" and cfg.segment.sequence_resolved:
             error = request_overflow(CapacityRequest(cfg.extract.llm, prompt, action_schema()), ctx)
             if error is not None:
                 raise error

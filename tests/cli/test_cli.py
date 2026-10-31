@@ -91,6 +91,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_postprocessing.py",
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
+    "labelkit/common/config/_segment_image.py",  # v1.22 图片模式配置规则
     "labelkit/common/config/_sequence_layout.py",  # v1.21 timeline 与交织配置闭包
     "labelkit/common/config/_sections.py",
     "labelkit/common/config/_temporal.py",
@@ -99,10 +100,13 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/model.py",
     "labelkit/common/contracts/execution.py",
     "labelkit/common/contracts/generation.py",
+    "labelkit/common/contracts/post_validation.py",  # v1.22 M8 通用后校验接缝的中立载体
+    "labelkit/common/contracts/regions.py",
     "labelkit/common/contracts/sequence_capacity.py",
     "labelkit/common/contracts/stage.py",
     "labelkit/common/contracts/types.py",
     "labelkit/common/errors.py",
+    "labelkit/common/extensions/box_parser.py",
     "labelkit/common/extensions/hooks.py",
     "labelkit/common/extensions/postprocessing.py",
     "labelkit/common/observability/console_format.py",
@@ -133,11 +137,14 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/operators/generation/scenario.py",
     "labelkit/operators/generation/state.py",
     "labelkit/operators/ingest.py",
+    "labelkit/operators/ingest_image.py",  # v1.22 图片模式发现与读取
     "labelkit/operators/quality.py",
     "labelkit/operators/quality_capacity.py",
     "labelkit/operators/quality_calls.py",
     "labelkit/operators/segment.py",
     "labelkit/operators/segment_capacity.py",
+    "labelkit/operators/segment_geometry.py",  # v1.22 Shapely 唯一导入点
+    "labelkit/operators/segment_image.py",  # v1.22 图片模式阶段
     "labelkit/operators/stitch.py",
     "labelkit/operators/stream_verify.py",
     "labelkit/operators/verify.py",
@@ -155,6 +162,8 @@ EXPECTED_PRODUCTION_PY = {
 }
 
 EXPECTED_TEST_PY = {
+    "tests/cli/test_image_cli.py",
+    "tests/integration/test_segment_image_llm.py",
     "tests/common/contracts/test_sequence_capacity.py",
     "tests/integration/test_sequence_context_capacity_local_llm.py",
     "tests/operators/test_dedup_session.py",
@@ -168,12 +177,18 @@ EXPECTED_TEST_PY = {
     "tests/common/config/test_generation.py",
     "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
     "tests/common/config/test_postprocessing_config.py",
+    "tests/common/config/test_segment_mode_config.py",
     "tests/common/config/test_temporal.py",
     "tests/common/config/test_temporal_config.py",
     "tests/common/contracts/test_execution.py",
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_generation_contracts.py",
+    "tests/common/contracts/test_image_region_closure.py",
+    "tests/common/contracts/test_post_validation.py",
+    "tests/common/contracts/test_region_overlay.py",
+    "tests/common/contracts/test_regions.py",
     "tests/common/contracts/test_types.py",
+    "tests/common/extensions/test_box_parser.py",
     "tests/common/extensions/test_hooks.py",
     "tests/common/extensions/test_postprocessing.py",
     "tests/common/observability/test_console_format.py",
@@ -182,11 +197,14 @@ EXPECTED_TEST_PY = {
     "tests/common/inference/test_credentials.py",    # v1.17 secret-free 凭据面
     "tests/common/inference/test_generation_prompts.py",
     "tests/common/inference/test_llm_client.py",
+    "tests/common/inference/test_post_validation_seam.py",
+    "tests/common/inference/test_region_ref_engine.py",
     "tests/common/inference/test_schema_engine.py",
     "tests/common/inference/test_postprocessing_schema_engine.py",
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
+    "tests/image_damage_helpers.py",
     "tests/llm_client_helpers.py",
     "tests/integration/test_annotate_llm.py",
     "tests/integration/test_annotation_repair_context_llm.py",
@@ -220,13 +238,25 @@ EXPECTED_TEST_PY = {
     "tests/operators/generation/test_render.py",
     "tests/operators/generation/test_scenario.py",
     "tests/operators/generation/test_state.py",
+    "tests/operators/test_annotate_image.py",
+    "tests/operators/test_dedup_image.py",
+    "tests/operators/test_emitter_image.py",
+    "tests/operators/test_image_bypass.py",
+    "tests/operators/test_image_examples.py",
     "tests/operators/test_ingest.py",
+    "tests/operators/test_ingest_image.py",
+    "tests/operators/test_verify_image.py",
     "tests/operators/test_quality.py",
+    "tests/operators/test_region_context.py",
     "tests/operators/test_segment.py",
+    "tests/operators/test_segment_geometry.py",
+    "tests/operators/test_segment_image.py",
     "tests/operators/test_stitch.py",
     "tests/operators/test_verify.py",
     "tests/orchestration/test_application.py",
+    "tests/orchestration/test_image_workflow.py",
     "tests/orchestration/test_process_workflow.py",
+    "tests/orchestration/test_segment_mode_rekey.py",
     "tests/orchestration/test_sequence_workflow.py",
     "tests/runtime/test_resources.py",
     "tests/runtime/test_scheduler.py",
@@ -373,7 +403,8 @@ def test_package_layout_dependency_direction():
             families = (
                 {"annotate", "annotate_capacity", "annotation_finalization"},
                 {"classify", "classify_capacity"}, {"dedup", "dedup_session"},
-                {"quality", "quality_capacity", "quality_calls"}, {"segment", "segment_capacity"},
+                {"ingest", "ingest_image"},
+                {"quality", "quality_capacity", "quality_calls"}, {"segment", "segment_capacity", "segment_image", "segment_geometry"},
                 {"verify", "stream_verify", "verify_capacity"},
             )
             for family in families:
@@ -704,7 +735,7 @@ def test_build_stages_frame_only_or_gate_includes_classify_stage():
     序列级判决由 stage 内 classify.enabled 门静默跳过（test_classify 守护）。"""
     from labelkit.operators.classify import ClassifyStage
 
-    cfg = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    cfg = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                frame_classify=FrameClassifyConfig(enabled=True, llm="default"))
     stages = build_stages(cfg)
     assert [s.name for s in stages] == ["segment", "dedup", "classify",
@@ -719,13 +750,13 @@ def test_referenced_profiles_segment_strategy_gate():
     """S30: segment.llm joins the probe set ONLY when segment is enabled AND
     strategy ∈ {llm, hybrid} — the rules strategy makes zero segment LLM calls,
     so its profile is never probed; chain position: segment heads the list."""
-    hybrid = _cfg(segment=SegmentConfig(enabled=True, strategy="hybrid", llm="judge"))
+    hybrid = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid", llm="judge"))
     assert referenced_profiles(hybrid)[0] == ["judge", "default"]
 
-    llm_only = _cfg(segment=SegmentConfig(enabled=True, strategy="llm", llm="judge"))
+    llm_only = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="llm", llm="judge"))
     assert referenced_profiles(llm_only)[0] == ["judge", "default"]
 
-    rules = _cfg(segment=SegmentConfig(enabled=True, strategy="rules", llm="judge"))
+    rules = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules", llm="judge"))
     assert referenced_profiles(rules)[0] == ["default"]
 
     disabled = _cfg(segment=SegmentConfig(enabled=False, strategy="hybrid",
@@ -736,7 +767,7 @@ def test_referenced_profiles_segment_strategy_gate():
 def test_referenced_profiles_extract_always_when_enabled():
     """S30: extract.llm is referenced whenever extract is enabled; slot follows
     the chain order — after classify, before quality."""
-    cfg = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    cfg = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                extract=ExtractConfig(enabled=True, llm="fixer"),
                classify=_classify_cfg(llm="judge"))
     llms, _ = referenced_profiles(cfg)
@@ -751,7 +782,7 @@ def test_build_stages_stream_inserts_segment_and_extract():
     from labelkit.operators.extract import ExtractStage
     from labelkit.operators.segment import SegmentStage
 
-    cfg = _cfg(segment=SegmentConfig(enabled=True),
+    cfg = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                extract=ExtractConfig(enabled=True),
                classify=_classify_cfg())
     stages = build_stages(cfg)
@@ -768,17 +799,17 @@ def test_referenced_profiles_stitch_enabled_only():
     """v1.9: stitch.llm joins the probe set iff stitch is enabled (pure-text
     judgment — referenced regardless of strategy/vision); slot follows the
     chain order — after segment, before classify."""
-    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    on = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
               stitch=StitchConfig(enabled=True, llm="judge"))
     assert referenced_profiles(on)[0] == ["judge", "default"]
 
-    chain = _cfg(segment=SegmentConfig(enabled=True, strategy="hybrid",
+    chain = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="hybrid",
                                        llm="fixer"),
                  stitch=StitchConfig(enabled=True, llm="judge"),
                  classify=_classify_cfg(llm="default"))
     assert referenced_profiles(chain)[0] == ["fixer", "judge", "default"]
 
-    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    off = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                stitch=StitchConfig(enabled=False, llm="judge"))
     assert referenced_profiles(off)[0] == ["default"]
 
@@ -789,12 +820,12 @@ def test_referenced_profiles_stitch_enabled_only():
 def test_referenced_profiles_frame_classify_enabled_only():
     """v1.12: frame.classify.llm joins the probe set iff enabled; slot follows
     the chain order — right after sequence-level classify."""
-    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    on = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
               classify=_classify_cfg(llm="default"),
               frame_classify=FrameClassifyConfig(enabled=True, llm="judge"))
     assert referenced_profiles(on)[0] == ["default", "judge"]
 
-    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    off = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                frame_classify=FrameClassifyConfig(enabled=False, llm="judge"))
     assert referenced_profiles(off)[0] == ["default"]
 
@@ -802,12 +833,12 @@ def test_referenced_profiles_frame_classify_enabled_only():
 def test_referenced_profiles_frame_annotate_enabled_only():
     """v1.12: frame.annotate.llm joins the probe set iff enabled; slot follows
     the chain order — right after sequence-level annotate."""
-    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    on = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
               frame_annotate=FrameAnnotateConfig(enabled=True, llm="judge",
                                                  instruction="标注帧意图"))
     assert referenced_profiles(on)[0] == ["default", "judge"]
 
-    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+    off = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, strategy="rules"),
                frame_annotate=FrameAnnotateConfig(enabled=False, llm="judge"))
     assert referenced_profiles(off)[0] == ["default"]
 
@@ -817,7 +848,7 @@ def test_build_stages_inserts_stitch_between_segment_and_dedup():
     enabled; disabled keeps the v1.8 list byte-identical."""
     from labelkit.operators.stitch import StitchStage
 
-    cfg = _cfg(segment=SegmentConfig(enabled=True),
+    cfg = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                stitch=StitchConfig(enabled=True),
                extract=ExtractConfig(enabled=True))
     stages = build_stages(cfg)
@@ -825,7 +856,7 @@ def test_build_stages_inserts_stitch_between_segment_and_dedup():
                                         "quality", "annotate"]
     assert isinstance(stages[1], StitchStage)
 
-    off = _cfg(segment=SegmentConfig(enabled=True))
+    off = _cfg(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     assert [s.name for s in build_stages(off)] == ["segment", "dedup", "quality",
                                                    "annotate"]
 

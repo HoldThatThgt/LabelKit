@@ -2,7 +2,7 @@
 
 ### 3.14.1 职责与边界
 
-**做：**（v1.8 新增算子）把完整候选会话精化为 episode：对 `status="active"` 的帧信封按 `session_id` 重组会话（M10 装箱时盖章，3.10.3），可选 LLM 滑窗边界裁决与逐帧噪声标记（3.14.4）；成员信封置 `absorbed`、噪声帧置 `dropped_noise`，按序键拼装序列 Record 并向批尾追加 episode 信封（4.3 契约 ②b）。链序位于链首（`_CHAIN_ORDER` 首位、dedup 之前，3.10.3）——episode 形成先于一切逐条算子：帧级判重语义在连续 UI 帧上失效，重复判定改为 episode 级（3.3）；类标签、质量分、标注全部以 episode 为单位。`segment.enabled = false`（默认）时本算子不入链，工具行为与 v1.7 一致（输出仅多 `_meta.stream: null` 恒在键，6.3）。
+**做：**（v1.8 新增算子）把完整候选会话精化为 episode：对 `status="active"` 的帧信封按 `session_id` 重组会话（M10 装箱时盖章，3.10.3），可选 LLM 滑窗边界裁决与逐帧噪声标记（3.14.4）；成员信封置 `absorbed`、噪声帧置 `dropped_noise`，按序键拼装序列 Record 并向批尾追加 episode 信封（4.3 契约 ②b）。链序位于链首（`_CHAIN_ORDER` 首位、dedup 之前，3.10.3）——episode 形成先于一切逐条算子：帧级判重语义在连续 UI 帧上失效，重复判定改为 episode 级（3.3）；类标签、质量分、标注全部以 episode 为单位。本章只描述 `segment.sequence_resolved = true` 的流模式；`segment.mode = "image"` 由 `SegmentImageStage` 承担，见 3.18。`segment.enabled = false`（默认，此处仅指开关）时本算子不入链，工具行为与 v1.7 一致（输出仅多 `_meta.stream: null` 恒在键，6.3）。
 **不做：**不排序、不会话化（`[stream]` 规则层属 M2，3.2；M14 收到的是完整会话）；不判重（M3）；不推断动作（M15）；不打任务标签（M5）；不改链结构（②b 改变的只是批内信封基数与状态，与 ②a 同为受控例外）。
 
 **v1.18 sequence generation 边界：**sequence `generate_only` 直接投影 primary sequence 与 stream event，不进入 M14。只有把生成的 stream 工件作为普通 process 输入并开启 `segment` 时，本算子才按本节既有规则处理；`owner_sequence_id`、role、noise 与 replay provenance 都不是分段 oracle。因而 replay 验收检验的是普通内容分段与噪声移除路径，不是生成真值直通。
@@ -168,7 +168,8 @@ process session 的 Schema 调用使用 `CallScope.complete_evidence=true`：L3 
 
 | 键 | 类型 / 默认 | 说明与约束 |
 |---|---|---|
-| `enabled` | bool / `false` | stream 模式总开关。false = 不入链、行为与 v1.7 一致（输出仅多 `_meta.stream: null`）。启用要求 `run.mode="process"` ∧ `generate.enabled=false`（含 generate_only 传递闭合）∧ `annotate.enabled=true`（2.3.1）。`[stream]`/`[segment]`/`[extract]` 在场而本键为 false ⇒ M1 no-op warning（3.1.4）。 |
+| `enabled` | bool / `false` | segment 阶段总开关（v1.22 起仅指开关，流模式判据是 `sequence_resolved`）。false = 不入链、行为与 v1.7 一致（输出仅多 `_meta.stream: null`）。启用要求 `run.mode="process"` ∧ `generate.enabled=false`（含 generate_only 传递闭合）；流模式另要求 `annotate.enabled=true`（2.3.1）。`[stream]`/`[segment]`/`[extract]` 在场而本键为 false ⇒ M1 no-op warning（3.1.4）。 |
+| `mode` | `"image"` 或 `"sequence"` / 无默认 | v1.22：`enabled = true` 时必填，无别名（rule 72）。本章键表只适用于 `"sequence"`；`sequence_resolved = enabled ∧ mode == "sequence"` 是解析产物，永非用户键。`"image"` 的键合法性见 5.2.2 与 3.18。 |
 | `strategy` | `"rules"`\|`"llm"`\|`"hybrid"` / `"hybrid"` | 三态语义见 3.14.4 策略表。 |
 | `llm` | str / `"default"` | 边界 profile 必须声明正 context_window；UI 必须支持 vision。 |
 | `window` | int / `20` | 完整证据窗口的帧数上限，至少两帧；实际请求仍完整计量。 |

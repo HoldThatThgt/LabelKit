@@ -22,7 +22,6 @@ from labelkit.common.contracts.generation import (
     GenerationProgram,
     GenerationServices,
     ObservedEvent,
-    PostValidatedCallRequest,
     RenderEventRequest,
     ScenarioPlan,
     ScenarioSeed,
@@ -31,6 +30,7 @@ from labelkit.common.contracts.generation import (
     SemanticReviewEvent,
     StateEvaluationRequest,
 )
+from labelkit.common.contracts.post_validation import PostValidatedCallRequest
 from labelkit.common.config.generation import declared_actor_names, is_generation_frame_eligible
 from labelkit.common.errors import (
     ContextOverflowError,
@@ -271,11 +271,14 @@ async def _plan_validated_event(
     except SchemaViolation as exc:
         kind = _plan_rejection_kind(exc)
         raise GenerationAttemptRejected(kind, context.slot.slot_key) from None
+    if not isinstance(result.proof, EventExecution):
+        _log.error("event plan post-validation proof is not an EventExecution")
+        raise InternalError("event plan post-validation proof is not an EventExecution")
     plan = EventPlan(
         result.object["frame_class"], result.object["actor"], result.object["intent"],
         tuple(result.object["patch"]),
     )
-    return plan, result.event_execution
+    return plan, result.proof
 
 
 async def generate_slot_traces(

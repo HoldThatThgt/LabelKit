@@ -1,7 +1,7 @@
 # 第 5 章　准备你的数据：格式、排布与常见陷阱
 
 > 本章回答一个具体的问题：「我手里的数据要整理成什么样，LabelKit 才能吃进去？」
-> 两种模态分开讲，每种都给出合法样例、判坏规则和排布建议。
+> 两种模态分开讲，每种都给出合法样例、判坏规则和排布建议；图片模式（`segment.mode = "image"`，v1.22）的输入规则见 5.6。
 
 ## 5.1 文本模态：JSONL 的规矩
 
@@ -104,6 +104,8 @@ capture/2026-07-01/
 
 空文件或全坏行的树文件 ⇒ 整条记录按坏记录跳过。
 
+**只有图片？**普通 UI 模态下只有图片的编号记为缺对，只有图片的目录以 `no valid records` 退出。纯图片只在 `segment.mode = "image"` 下才能摄取，规则见 5.6。
+
 ### 图像的约束
 
 - 格式：PNG / JPEG;
@@ -161,3 +163,50 @@ InputError: no valid records: input.jsonl (scanned=14 bad_input=14 missing_pair=
 ```
 
 「一条合法记录都没有」被视为输入错误而不是一次成功的空跑——看到这行，先查字段名。（配 `on_bad_line = "fail"` 则更早：第一条坏行处即退出码 3。只要有部分行合法，skip 策略照常跳过坏行跑完，坏行只计入 `bad_input`。）
+
+## 5.6 图片模式：图片必需，伴随文件可选（v1.22）
+
+`segment.mode = "image"` 时一张图片就是一个样本。LabelKit **不解析控件树**，也不判断图片旁边的数据是什么：工程注册 `segment.box_parser` 钩子，把自己的格式转成参考框数组（第 14 章 14.8）。不注册钩子就不读任何伴随文件。功能总览见第 28 章。
+
+```
+capture/
+├── image_1.png     ┐
+├── image_1.xml     ┘ ⇒ 样本 1，带伴随文件
+├── sub/image_2.png ┐
+├── image_2.xml     ┘ ⇒ 样本 2，允许跨子目录配对
+├── image_3.png       ⇒ 写了 instruction：样本 3，无伴随文件；没写：缺对
+├── image_9.xml       ⇒ 只有伴随文件：缺对
+└── notes.txt         ⇒ 计入 counts.ignored_files
+```
+
+**发现规则：**
+
+- 图片沿用 `image_<n>.png/.jpg/.jpeg` 命名与全局 index 命名空间，递归扫描，跨子目录共用。任意文件名的照片目录不在范围内。
+- 同一 index 两张以上图片（包括 png 与 jpg 并存）是 `index_conflict`，遵循 `input.on_index_conflict`。
+- 伴随文件只在注册了 `box_parser` 时参与发现：文件名是 `image_<n>` 加 `companion_suffix`（大小写严格匹配），按 index 与图片配对。同一 index 两个以上伴随文件也是 `index_conflict`。
+- 只有伴随文件是缺对，遵循 `input.on_missing_pair`。只有图片时看配置：写了 `segment.instruction` 合法，模型依据图片生成候选；没写时伴随文件是候选的唯一来源，所以记缺对，计 `missing_pair` 与 `bad_input`，不产生记录，不会写成空候选。
+- 既不是图片、也不是已声明伴随文件的文件计入 `counts.ignored_files`，并给一条只含计数的 WARN。它不计入 `scanned` 与 `bad_input`，不参与守恒式。未注册钩子时所有非图片文件都计入。
+- `uitree_<n>.jsonl` 在图片模式下没有特殊含义。沿用这批数据时改名为 `image_<n>.jsonl`，声明 `companion_suffix = ".jsonl"`，再写一个钩子解析它。
+
+**接入检查与记录身份：**
+
+- 文件头由 ingest 检查：魔数、`input.max_image_mb`，再用 Pillow 只读文件头，格式必须可识别，`width × height` 不超过 Pillow 的 `MAX_IMAGE_PIXELS`。失败按坏记录计 `bad_input`。
+- 伴随文件按原始字节读入，不解码、不解释。没有单文件大小上限，字节随记录驻留到批结束。钩子在事件循环线程上同步执行，解析很大的文件会推迟同批其他请求，所以**钩子要保持轻量**。
+- 记录 id 是 `sha256(伴随字节 + 图片字节)` 的前 16 位。没有伴随文件与零字节伴随文件同 id，但后者仍会调用钩子。
+
+**图片方向与对齐由你负责。**LabelKit 不读取、不应用、也不拒收 EXIF 方向标签。画布恒为存储像素网格，钩子收到的宽高、参考框与候选几何都按存储像素解释，参考框是否与图片对齐也由你保证，框架不做配准或缩放推断。
+
+带方向标签的 JPEG 有一个已知残余：未缩放时原样发送并保留标签，服务端若按标签旋转显示，模型看到的方向可能与按存储像素绘制的叠图不同，segment 的网格坐标也会按存储画布投影而错位。**有方向标签的照片，请先把方向写进像素再交给 LabelKit**，并让伴随数据的坐标对应转换后的图片：
+
+```python
+from PIL import Image, ImageOps
+
+with Image.open("raw/image_7.jpg") as image:
+    ImageOps.exif_transpose(image).save("capture/image_7.jpg", quality=95)
+```
+
+实跑一张 400 × 300、Orientation = 6 的 JPEG，转换后为 300 × 400，方向标签消失。
+
+**透明通道。**叠图恒把透明通道合成到白底；原图请求不经这条链路，未缩放时原样发送，透明通道怎么显示由服务端决定。所以带透明通道的原图在原图请求与叠图里可能呈现不同（不影响几何），**建议交付不透明图片**。
+
+自查：`[segment]` 写了 `mode = "image"`？伴随文件后缀与 `companion_suffix` 大小写一致？`counts.ignored_files` 是预期的数吗？

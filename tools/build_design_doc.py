@@ -44,7 +44,7 @@ ORDER = [
     "307-m7-verify", "308-m8-schema-engine", "309-m9-llm-client",
     "310-m10-orchestration", "311-m11-emitter", "312-m12-logging",
     "313-m13-classify", "314-m14-segment", "315-m15-extract",
-    "316-m16-stitch", "317-m17-execution-runtime",
+    "316-m16-stitch", "317-m17-execution-runtime", "318-m14-segment-image",
     "40-ch4-data-structures", "50-ch5-config-spec", "60-ch6-io-formats",
     "70-ch7-logging", "80-ch8-nongoals-roadmap", "85-ch9-references",
     "90-appendix-a-rubrics",

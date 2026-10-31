@@ -38,7 +38,8 @@ order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅�
 key = ["source_dir"]              # 分区键：每个场景子目录一个会话
 
 [segment]
-enabled = true                    # stream 模式总开关
+enabled = true                    # segment 阶段开关
+mode = "sequence"                 # 时序流分割（启用时必填）
 strategy = "hybrid"               # 滑窗 LLM 边界精化 + 逐帧噪声标记
 window = 16                       # ≥ 最长会话（15 帧）：每会话恰一窗，边界裁决见全会话上下文
 min_len = 2                       # 孤帧段以 below_min_len 落选 → 进 stitch 救援候选

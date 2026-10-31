@@ -2871,3 +2871,20 @@ def test_verify_leaf_seams_never_submit_nested_task_groups():
     member_annotation = asyncio.run(annotate_member_leaf(text_member(0), ctx))
     assert record_annotation is not None and member_annotation is not None
     assert tasks.requests == []
+
+
+# ── v1.22 图片变体的回归锚：文本与普通 UI 的字节不变 ─────────────────────────────
+
+def test_prompt_without_regions_keeps_text_and_ui_bytes():
+    assert AnnotatePromptOptions().regions is None
+    text_prompt = build_annotate_prompt(text_record(), make_cfg(), SCHEMA_TEXT)
+    assert text_prompt.messages[-1].parts[0].text == "[待标注数据] 帮我写一条请假条，明天上午要去医院"
+    assert len(text_prompt.messages[-1].parts) == 1
+
+    rec = ui_record()
+    parts = build_annotate_prompt(rec, make_cfg(modality="ui"), SCHEMA_TEXT).messages[-1].parts
+    assert [part.kind for part in parts] == ["text", "image", "text"]
+    assert parts[0].text == "[屏幕截图]"
+    assert parts[1].image is rec.image
+    assert parts[2].text == ('[UI 控件树]\nFrameLayout [0,0,1080,1920]\n  EditText "请输入手机号" [72,520,1008,664]\n'
+                             '  Button "登录" [72,952,1008,1096]')

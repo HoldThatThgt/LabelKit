@@ -1,0 +1,44 @@
+# 孔洞与多部件候选，配缩放请求：图片长边 2601 超过默认 max_image_px，请求按同一逐轴比例缩放原图与叠图。
+# 通用模型不一定能画出孔洞与多部件，所以离线测试用 fixtures/fixed-candidates.json 作为 segment 的固定输出，
+# 再断言 _meta.regions 与最终标注里的像素几何逐值等于夹具里独立算出的期望值。
+schema_version = 1
+
+[run]
+input = "./data/fixed"
+output = "./out/fixed.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[dedup]
+enabled = false
+
+[segment]
+enabled = true
+mode = "image"
+llm = "default"
+instruction = """
+为图片中的每个色块生成候选区域。中空的色块用内环表示孔洞；同色且彼此分离的色块放进同一个区域的多个多边形。
+"""
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:keep_polygons"
+instruction = """
+判断每个候选区域的形状。通过 region_id 引用候选，label 写形状名称。
+"""
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-polygons.json"
+meta_mode = "inline"
+rejects = "refs"

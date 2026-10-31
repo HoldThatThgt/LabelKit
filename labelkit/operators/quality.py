@@ -630,8 +630,13 @@ def _ui_parts(record: Record, label: str, ui_tree_max_chars: int,
     @param label 槽位标签
     @param ui_tree_max_chars 控件树序列化的字符上限
     @param fit 装填状态；None = 预算关闭
-    @return 三条消息部件
+    @return 三条消息部件；v1.22 图片模式无树时只有标签与图片，fit 只计标签文本
     """
+    if record.ui_tree is None:
+        head = f"[{label} 图片]"
+        if fit is not None and budget.est_text(head) > fit.side_share:
+            fit.overflow = True
+        return [Part(kind="text", text=head), Part(kind="image", image=record.image)]
     tree = record.ui_tree.serialize(max_chars=ui_tree_max_chars) if record.ui_tree else ""
     head = f"[{label} 屏幕截图]"
     tree_label = f"[{label} UI 控件树]\n"
@@ -1583,7 +1588,7 @@ class QualityStage:
         )
         return _build_pairwise_prompt(
             pair, call.criteria, call.with_reason,
-            None if self.cfg.run.mode == "process" and self.cfg.segment.enabled else self.cfg.input.ui_tree_max_chars,
+            None if self.cfg.segment.sequence_resolved else self.cfg.input.ui_tree_max_chars,
             fit,
         )
 

@@ -198,7 +198,7 @@ VerificationResult(
 
 process stream 的 episode 继续使用 3.7.2 缺陷表与成员手术。v1.20 生成 sequence 是 text 模态的完整
 主序列候选，使用既有 verdict Schema 的判决形模板；两者按调用入口区分，不以
-`segment.enabled` 猜测。
+`segment.sequence_resolved` 猜测。
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -249,3 +249,28 @@ repair annotation wave 与复审。每轮 repair 仍只把上一版 model-space 
 注入 `first_resource_start_milliseconds`，再跑完整 class Schema 与 L2.5。替换、遗漏 context，或让 verify 从 main
 metadata、member payload、wall clock 推断时间，都是 internal contract error。stream verify 的 reannotate leaf 同样调用
 该统一 finalizer；M7 不新增第二套时间修复代码。
+
+### 3.7.6 图片模式（v1.22）
+
+**评审提示词（CONTRACTS §10.5 冻结）。**system 不变。`VerifyPromptOptions.regions is not None` 时 user 消息沿用 3.5.7 的记录渲染顺序，随后是 `[标注结果]`：
+
+```text
+text part:  [任务指令] {instruction}\n[原始数据]\n[原图]
+image part: record.image
+text part:  [候选区域叠图]
+image part: RegionOverlayRef(record.image, regions)
+text part:  [参考框]\n{render_reference_boxes(regions)}      ← 有参考框且写了 instruction 时
+text part:  [候选区域]\n{render_candidates(regions)}\n{render_material_note(regions)}\n[标注结果] {json.dumps(output, ensure_ascii=False)}
+```
+
+文本与普通 UI 的现有字节保持为回归锚点。`VerifyPromptOptions.regions` 由 `_plan_classic_review` 从 `state.item.regions` 填入。
+
+**计费与路由。**`_panel_fit` 按 `VerifyPromptOptions.regions` 判定按两张图计费，候选块计为固定块。流驱动路由改用 `episodes and cfg.segment.sequence_resolved`；图片样本是 `kind = "single"`，到不了流驱动器。
+
+**修复。**`_reannotate_leaf` 把 `state.item.regions` 传入 `AnnotatePromptOptions`，复核返工与首轮标注读取同一候选对象；verify 从不调用 segment，不重新分割。
+
+**多评委溢出（D11）。**配置了 `verify.judges` 时，任一评委的服务端超限或评委自身修复轮溢出沿用现行语义，经 `_judge_error_entry` 降成一条 `judge_error` 反对票，不喂熔断；只有阶段级预检以 `context_overflow` 失败。
+
+**已知成本。**评审在 `[标注结果]` 中再次看到代码负责字段里的几何（原图像素浮点），与 `[候选区域]`（网格）重复，且都不可裁剪，verify 可能在 annotate 成功后才溢出。材料说明给出画布尺寸供对照。本特性不提供消除重复的手段；要消除须先修订 `SPEC-annotation-postprocessing.md` §5.1。
+
+**trace excerpt。**`_excerpt_source` 在 `record.ui_tree is None` 时返回 `""`。

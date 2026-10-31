@@ -3,7 +3,8 @@
 > 状态：全部规格功能已实现；完整离线、覆盖率、文档、本地 4B 与 Uncle Bob 门禁全部通过
 > 日期：2026-09-09
 > 实施基线：`56a0ea1`
-> 范围：`run.mode = "process"` 且 `segment.enabled = true` 的文本与 UI 序列处理
+> 范围：`run.mode = "process"` 且 `segment.sequence_resolved = true`（`segment.enabled = true` 且 `segment.mode = "sequence"`）的文本与 UI 序列处理；本文的「流模式」一律指此条件
+> 2026-10-31 修订（v1.22）：适用范围由 `segment.enabled` 改为 `segment.sequence_resolved`，流模式行为零改动；`segment.mode = "image"` 不适用本规格，见 [SPEC-image-region-segmentation.md](SPEC-image-region-segmentation.md)
 
 ## 产品行为
 
