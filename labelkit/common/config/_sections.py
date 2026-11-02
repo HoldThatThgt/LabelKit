@@ -283,7 +283,7 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
         max_output_tokens=t.get_int("max_output_tokens", 4096, minimum=1),
         context_window=t.get_int("context_window", 0, minimum=0),
         temperature=t.get_float("temperature", 0.0, bound=_GE0),
-        thinking=t.get_str("thinking", None, enum=("enabled", "disabled")),
+        thinking=t.get_str("thinking", None, enum=("enabled", "disabled", "adaptive")),
         extra_body=_parse_llm_extra_body(col, t, provider),
         max_image_px=t.get_int("max_image_px", 2048, minimum=1),
         default_image_px=t.get_int("default_image_px", 0, minimum=0),
@@ -333,11 +333,14 @@ def _parse_llm_extra_body(col: _Collector, t: _Tbl, provider: str) -> dict[str, 
     raw = t.take("extra_body")
     if raw is _MISSING:
         return {}
-    supported = provider == "openai_compatible"
+    supported = provider in ("openai_compatible", "anthropic")
     if not supported:
         col.error(f'{t.loc("extra_body")}: supported only for provider "openai_compatible"')
     if not isinstance(raw, dict):
         t.err("extra_body", "table", raw)
+        return {}
+    if provider == "anthropic" and set(raw) - {"output_config", "cache_control"}:
+        col.error(f'{t.loc("extra_body")}: unsupported Anthropic request options')
         return {}
     valid = _validate_extra_body_value(col, t.loc("extra_body"), raw)
     conflicts = sorted(_OPENAI_EXTRA_BODY_RESERVED_KEYS.intersection(raw))

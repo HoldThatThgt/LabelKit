@@ -674,7 +674,8 @@ def _build_anthropic_body(profile: LLMProfile, prompt: PromptBundle,
             "input_schema": response_schema,
         }]
         body["tool_choice"] = {"type": "tool", "name": STRUCTURED_TOOL_NAME}
-    return body
+    from labelkit.common.inference.native_cache import configure_native_body
+    return configure_native_body(body, profile.extra_body)
 
 
 def _build_embeddings_body(profile: EmbeddingProfile, texts: list[str]) -> dict:
@@ -727,7 +728,9 @@ def _parse_anthropic_response(data: Mapping, fallback_model: str
             if isinstance(payload, Mapping):
                 structured = dict(payload)
     raw_usage = data.get("usage") or {}
-    usage = Usage(prompt_tokens=int(raw_usage.get("input_tokens") or 0),
+    total_input = sum(int(raw_usage.get(key) or 0) for key in
+                      ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    usage = Usage(prompt_tokens=total_input,
                   completion_tokens=int(raw_usage.get("output_tokens") or 0))
     model = str(data.get("model") or fallback_model)
     stop_reason = data.get("stop_reason")
@@ -1653,9 +1656,13 @@ class LLMClient:
                 start = time.monotonic()
                 try:
                     async with asyncio.timeout(ctx.prof.timeout_s):
-                        resp = await self._http().post(
-                            ctx.spec.url, json=body, headers=headers,
-                            timeout=httpx.Timeout(ctx.prof.timeout_s))
+                        if ctx.prof.provider == "anthropic":
+                            from labelkit.common.inference.native_stream import post_native_stream
+                            resp = await post_native_stream(self._http(), ctx.spec.url, body, headers, ctx.prof.timeout_s)
+                        else:
+                            resp = await self._http().post(
+                                ctx.spec.url, json=body, headers=headers,
+                                timeout=httpx.Timeout(ctx.prof.timeout_s))
                 except httpx.PoolTimeout as exc:
                     _logger.error("HTTP pool exhausted after explicit origin admission")
                     raise InternalError(
@@ -1669,6 +1676,9 @@ class LLMClient:
             return _AttemptFailure(message=f"{type(exc).__name__}: {detail}")
         else:
             ctx.latency_ms = int((time.monotonic() - start) * 1000)
+            if ctx.prof.provider == "anthropic":
+                from labelkit.common.inference.native_cache import record_native_response
+                record_native_response(resp, body)
             if 200 <= resp.status_code < 300:
                 return self._settle_2xx(ctx, ks, ku, resp)
             return _classify_http_failure(resp)
