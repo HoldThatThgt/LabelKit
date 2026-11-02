@@ -1091,9 +1091,6 @@ class ProcessWorkflow:
             "verify": cfg.verify.enabled,
         }
         by_name = {s.name: s for s in self.stages}
-        # 本批独立图片先按整屏分类，再生成候选并应用类别专用标注指令。
-        if self.cfg.segment.mode == "image" and set(by_name) == {"classify", "segment", "annotate"}:
-            return [by_name[n] for n in ("classify", "segment", "annotate")]
         return [by_name[n] for n in _CHAIN_ORDER if enabled[n] and n in by_name]
 
     # ── 运行级统计汇总 ─────────────────────────────────────────────────────
