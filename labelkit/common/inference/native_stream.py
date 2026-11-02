@@ -16,7 +16,7 @@ async def post_native_stream(http, url, body, headers, timeout):
                 raise httpx.RemoteProtocolError("Anthropic stream ended before message_stop")
             result = await stream.get_final_message()
             return httpx.Response(stream.response.status_code, json=result.model_dump(mode="json",exclude_none=True),
-                                  request=stream.response.request, extensions={"native_message_stop":True})
+                                  request=stream.response.request)
     except APIStatusError as error:
         await error.response.aread()
         return error.response

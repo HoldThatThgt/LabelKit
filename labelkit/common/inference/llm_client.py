@@ -1676,9 +1676,6 @@ class LLMClient:
             return _AttemptFailure(message=f"{type(exc).__name__}: {detail}")
         else:
             ctx.latency_ms = int((time.monotonic() - start) * 1000)
-            if ctx.prof.provider == "anthropic":
-                from labelkit.common.inference.native_cache import record_native_response
-                record_native_response(resp, body)
             if 200 <= resp.status_code < 300:
                 return self._settle_2xx(ctx, ks, ku, resp)
             return _classify_http_failure(resp)
